@@ -9,6 +9,22 @@ import (
 	"github.com/xuri/excelize/v2"
 )
 
+type exitCode int
+
+const (
+	// Exit codes must not change between versions,
+	// only new ones can be added
+	// This is also why we do not use iota here
+	ok            exitCode = 0
+	databaseError exitCode = 1
+	loggingError  exitCode = 2
+	teaError      exitCode = 3
+)
+
+func exit(code exitCode) {
+	os.Exit(int(code))
+}
+
 type wordDatabase struct {
 	pronouns  []string
 	verbs     []string
@@ -18,13 +34,13 @@ type wordDatabase struct {
 func read_database() wordDatabase {
 	table, err := excelize.OpenFile("./words.xlsx")
 	if err != nil {
-		log.Printf("[ERROR] %v\n", err)
-		os.Exit(1)
+		log.Printf("[FATAL] %v\n", err)
+		exit(databaseError)
 	}
 	defer func() {
 		if err := table.Close(); err != nil {
-			log.Printf("[ERROR] %v\n", err)
-			os.Exit(1)
+			log.Printf("[FATAL] %v\n", err)
+			exit(databaseError)
 		}
 	}()
 
@@ -32,12 +48,12 @@ func read_database() wordDatabase {
 	dataSheet := sheets[0]
 	rows, err := table.GetRows(dataSheet)
 	if err != nil {
-		log.Printf("[ERROR] %v\n", err)
-		os.Exit(1)
+		log.Printf("[FATAL] %v\n", err)
+		exit(databaseError)
 	}
 	if len(rows) < 2 {
-		log.Println("[ERROR] Table containts less than 2 lines!")
-		os.Exit(1)
+		log.Println("[FATAL] Table containts less than 2 lines!")
+		exit(databaseError)
 	}
 	var pronouns []string
 	verbs := make([]string, len(rows)-1)
@@ -133,16 +149,16 @@ func main() {
 	f, err := tea.LogToFile("log", "debug")
 	defer f.Close()
 	if err != nil {
-		log.Printf("[ERROR] %v\n", err)
-		os.Exit(2)
+		log.Printf("[FATAL] %v\n", err)
+		exit(loggingError)
 	}
 
 	log.Println("[INFO] Starting app...")
 	p := tea.NewProgram(initialModel())
 	log.Println("[INFO] Starting UI loop...")
 	if _, err := p.Run(); err != nil {
-		log.Printf("[ERROR] Program finished with error:\n%v", err)
-		os.Exit(2)
+		log.Printf("[FATAL] Program finished with error:\n%v", err)
+		exit(teaError)
 	}
 	log.Println("[INFO] Finished successfully")
 }
