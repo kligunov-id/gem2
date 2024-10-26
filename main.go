@@ -1,7 +1,7 @@
 package main
 
 import (
-	"fmt"
+	"log"
 	"math/rand"
 	"os"
 
@@ -18,12 +18,12 @@ type wordDatabase struct {
 func read_database() wordDatabase {
 	table, err := excelize.OpenFile("./words.xlsx")
 	if err != nil {
-		fmt.Println(err)
+		log.Printf("[ERROR] %v\n", err)
 		os.Exit(1)
 	}
 	defer func() {
 		if err := table.Close(); err != nil {
-			fmt.Println(err)
+			log.Printf("[ERROR] %v\n", err)
 			os.Exit(1)
 		}
 	}()
@@ -32,10 +32,11 @@ func read_database() wordDatabase {
 	dataSheet := sheets[0]
 	rows, err := table.GetRows(dataSheet)
 	if err != nil {
-		fmt.Println(err)
+		log.Printf("[ERROR] %v\n", err)
+		os.Exit(1)
 	}
 	if len(rows) < 2 {
-		fmt.Println("Fatal error: Table containts less than 2 lines!")
+		log.Println("[ERROR] Table containts less than 2 lines!")
 		os.Exit(1)
 	}
 	var pronouns []string
@@ -78,10 +79,9 @@ func (database wordDatabase) getRandomQuestion() question {
 	var pronoun_index = rand.Intn(len(database.pronouns))
 	var verb_index = rand.Intn(len(database.verbs))
 	if len(database.verbForms[verb_index]) <= pronoun_index {
-		fmt.Println(
-			"No entry for ",
+		log.Printf(
+			"[WARNING] No database entry for \"%s\" + \"%s\"\n",
 			database.pronouns[pronoun_index],
-			" + ",
 			database.verbs[verb_index],
 		)
 		return database.getRandomQuestion()
@@ -116,6 +116,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case tea.KeyMsg:
 		switch msg.String() {
 		case "ctrl+c", "q", "esc":
+			log.Println("[INFO] Quitting...")
 			return m, tea.Quit
 		default:
 			m.q.verb = m.q.verb + msg.String()
@@ -129,9 +130,19 @@ func (m model) View() string {
 }
 
 func main() {
-	p := tea.NewProgram(initialModel())
-	if _, err := p.Run(); err != nil {
-		fmt.Printf("Program finished with error:\n%v", err)
+	f, err := tea.LogToFile("log", "debug")
+	defer f.Close()
+	if err != nil {
+		log.Printf("[ERROR] %v\n", err)
 		os.Exit(2)
 	}
+
+	log.Println("[INFO] Starting app...")
+	p := tea.NewProgram(initialModel())
+	log.Println("[INFO] Starting UI loop...")
+	if _, err := p.Run(); err != nil {
+		log.Printf("[ERROR] Program finished with error:\n%v", err)
+		os.Exit(2)
+	}
+	log.Println("[INFO] Finished successfully")
 }
