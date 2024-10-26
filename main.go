@@ -146,7 +146,7 @@ func (m model) View() string {
 }
 
 func main() {
-	f, err := tea.LogToFile("log", "debug")
+	f, err := tea.LogToFile("log", "")
 	defer f.Close()
 	if err != nil {
 		log.Printf("[FATAL] %v\n", err)
