@@ -5,7 +5,9 @@ import (
 	"math/rand"
 	"os"
 
+	"github.com/charmbracelet/bubbles/textinput"
 	tea "github.com/charmbracelet/bubbletea"
+	"github.com/charmbracelet/lipgloss"
 	"github.com/xuri/excelize/v2"
 )
 
@@ -88,7 +90,7 @@ type question struct {
 }
 
 func (q question) format() string {
-	return q.noun + " + " + q.verb + " = ?\n>> "
+	return q.noun + " + " + q.verb + " = ?"
 }
 
 func (database wordDatabase) getRandomQuestion() question {
@@ -110,16 +112,20 @@ func (database wordDatabase) getRandomQuestion() question {
 }
 
 type model struct {
-	database *wordDatabase
-	q        question
+	database   *wordDatabase
+	question   question
+	inputField textinput.Model
 }
 
 func initialModel() model {
 	database := read_database()
-	q := database.getRandomQuestion()
+	question := database.getRandomQuestion()
+	inputField := textinput.New()
+	inputField.Focus()
 	return model{
-		&database,
-		q,
+		database:   &database,
+		question:   question,
+		inputField: inputField,
 	}
 }
 
@@ -134,15 +140,19 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		case "ctrl+c", "q", "esc":
 			log.Println("[INFO] Quitting...")
 			return m, tea.Quit
-		default:
-			m.q.verb = m.q.verb + msg.String()
 		}
 	}
-	return m, nil
+	var cmd tea.Cmd
+	m.inputField, cmd = m.inputField.Update(msg)
+	return m, cmd
 }
 
 func (m model) View() string {
-	return m.q.format()
+	return lipgloss.JoinVertical(
+		lipgloss.Center,
+		m.question.format(),
+		m.inputField.View(),
+	)
 }
 
 func main() {
