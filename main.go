@@ -1,7 +1,6 @@
 package main
 
 import (
-	"fmt"
 	"log"
 	"math/rand"
 	"os"
@@ -93,10 +92,6 @@ type question struct {
 	correct_answer string
 }
 
-func (q question) format() string {
-	return q.noun + " + " + q.verb + " = ?"
-}
-
 func (database wordDatabase) getRandomQuestion() question {
 	var pronoun_index = rand.Intn(len(database.pronouns))
 	var verb_index = rand.Intn(len(database.verbs))
@@ -128,6 +123,8 @@ type model struct {
 	inputField    textinput.Model
 	isInAltscreen bool
 	mode          mode
+	height        int
+	width         int
 }
 
 func initialModel() model {
@@ -135,6 +132,9 @@ func initialModel() model {
 	question := database.getRandomQuestion()
 	inputField := textinput.New()
 	inputField.Focus()
+	inputField.Prompt = ""
+	inputField.Width = 15
+	inputField.CharLimit = 30
 	return model{
 		database:      &database,
 		question:      question,
@@ -145,7 +145,7 @@ func initialModel() model {
 }
 
 func (m model) Init() tea.Cmd {
-	return nil
+	return textinput.Blink
 }
 
 func exitNonExistingMode() {
@@ -155,6 +155,10 @@ func exitNonExistingMode() {
 
 func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
+	case tea.WindowSizeMsg:
+		m.height = msg.Height
+		m.width = msg.Width
+		return m, nil
 	case tea.KeyMsg:
 		switch msg.String() {
 		case "ctrl+c", "q", "esc":
@@ -201,7 +205,7 @@ func (m model) validateUpdate(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.inputField.Reset()
 			m.inputField.Focus() // Removes focus
 			m.mode = input
-			return m, nil
+			return m, textinput.Blink
 		}
 	}
 	var cmd tea.Cmd
@@ -221,43 +225,149 @@ func (m *model) toggleAltScreen() (*model, tea.Cmd) {
 func (m model) validateAnswer() string {
 	answerIsCorrect := m.question.correct_answer == strings.TrimSpace(m.inputField.Value())
 	if answerIsCorrect {
-		return "Correct!"
+		return correctAnswerStyle.Italic(true).Render("Correct!")
 	} else {
-		return fmt.Sprintf("Wrong!\nCorrect answer is %s", m.question.correct_answer)
+		return wrongAnswerStyle.Render(
+			italic("Wrong!") + background.Render(" Correct answer is: ") + bold(m.question.correct_answer),
+		)
 	}
+}
+
+var (
+	lightPink1    = lipgloss.ANSIColor(217)
+	lightPink3    = lipgloss.ANSIColor(174)
+	lightPink4    = lipgloss.ANSIColor(95)
+	darkSeaGreen1 = lipgloss.ANSIColor(193)
+	darkSeaGreen4 = lipgloss.ANSIColor(65)
+	darkSeaGreen2 = lipgloss.ANSIColor(157)
+	// Not using ANSI here since first 16 ones could be redefined
+	black = lipgloss.Color("#000000")
+)
+
+var (
+	background    = lipgloss.NewStyle().Background(black)
+	promptStyle   = background.Italic(true).Foreground(darkSeaGreen4)
+	questionStyle = background.Foreground(darkSeaGreen1).Width(45 - 14)
+	helpMsgStyle  = background.Foreground(lightPink4)
+	helpKeyStyle  = helpMsgStyle.Bold(true)
+
+	correctAnswerStyle = background.
+				AlignHorizontal(lipgloss.Center).
+				Width(39).
+				Foreground(darkSeaGreen2)
+	wrongAnswerStyle = background.
+				AlignHorizontal(lipgloss.Center).
+				Width(39).
+				Foreground(lightPink1)
+	boxStyle = background.
+			Align(lipgloss.Left, lipgloss.Center).
+			PaddingTop(1).
+			PaddingBottom(1).
+			PaddingLeft(3).
+			PaddingRight(3).
+			Width(45).
+			Height(9).
+			BorderStyle(lipgloss.RoundedBorder()).
+			BorderForeground(lightPink4).
+			BorderBackground(black)
+)
+
+func italic(s string) string {
+	return background.Italic(true).Render(s)
+}
+
+func bold(s string) string {
+	return background.Bold(true).Render(s)
+}
+
+type helpEntry struct {
+	bindings []string
+	action   string
+}
+
+var helpSeparator = helpMsgStyle.Render(" • ")
+
+func renderHelpRow(entries []helpEntry) string {
+	rendered_entries := make([]string, len(entries))
+	for i, entry := range entries {
+		rendered_entries[i] = helpKeyStyle.Render(strings.Join(entry.bindings, "/")) +
+			helpMsgStyle.Render(" "+entry.action)
+	}
+	help_row := strings.Join(rendered_entries, helpSeparator)
+	return lipgloss.NewStyle().Inline(true).Render(help_row)
+}
+
+func (m model) renderQuestion() string {
+	prompt_block := lipgloss.JoinVertical(
+		lipgloss.Right,
+		promptStyle.Render("Form Clue: "),
+		promptStyle.Render("Verb: "),
+		promptStyle.Render("Verb Form: "),
+	)
+	question_block := lipgloss.JoinVertical(
+		lipgloss.Left,
+		questionStyle.Render(m.question.noun),
+		questionStyle.Render(m.question.verb),
+		questionStyle.Render(m.inputField.View()),
+	)
+	return lipgloss.JoinHorizontal(
+		lipgloss.Top,
+		prompt_block,
+		question_block,
+	)
+}
+
+var inputHelp = [...]helpEntry{
+	{bindings: []string{"enter"}, action: "submit"},
+	{bindings: []string{"esc", "q"}, action: "exit"},
 }
 
 func (m model) inputView() string {
-	return lipgloss.JoinVertical(
-		lipgloss.Center,
-		m.question.format(),
-		m.inputField.View(),
+	return boxStyle.Render(lipgloss.JoinVertical(
+		lipgloss.Left,
+		m.renderQuestion(),
 		"",
-		"enter to submit, esc/q to quit",
-	)
+		"",
+		"",
+		renderHelpRow(inputHelp[:]),
+	))
+}
+
+var validationHelp = [...]helpEntry{
+	{bindings: []string{"enter"}, action: "continue"},
+	{bindings: []string{"esc", "q"}, action: "exit"},
 }
 
 func (m model) validationView() string {
-	return lipgloss.JoinVertical(
-		lipgloss.Center,
-		m.question.format(),
-		m.inputField.View(),
+	return boxStyle.Render(lipgloss.JoinVertical(
+		lipgloss.Left,
+		m.renderQuestion(),
 		"",
 		m.validateAnswer(),
 		"",
-		"enter to continue, esc/q to quit",
-	)
+		renderHelpRow(validationHelp[:]),
+	))
 }
 
 func (m model) View() string {
+	var content string
 	switch m.mode {
 	case input:
-		return m.inputView()
+		content = m.inputView()
 	case validation:
-		return m.validationView()
+		content = m.validationView()
+	default:
+		exitNonExistingMode()
 	}
-	exitNonExistingMode()
-	return "" // unreachable
+	if !m.isInAltscreen {
+		return content + "\n"
+	}
+	return lipgloss.NewStyle().
+		Align(lipgloss.Center, lipgloss.Center).
+		Width(m.width).
+		Height(m.height).
+		Background(black).
+		Render(content)
 }
 
 func main() {
