@@ -1,9 +1,11 @@
 package main
 
 import (
+	"fmt"
 	"log"
 	"math/rand"
 	"os"
+	"strings"
 
 	"github.com/charmbracelet/bubbles/textinput"
 	tea "github.com/charmbracelet/bubbletea"
@@ -17,10 +19,12 @@ const (
 	// Exit codes must not change between versions,
 	// only new ones can be added
 	// This is also why we do not use iota here
+	// as this would prevent accidental renumbering
 	ok            exitCode = 0
 	databaseError exitCode = 1
 	loggingError  exitCode = 2
 	teaError      exitCode = 3
+	internalError exitCode = 4
 )
 
 func exit(code exitCode) {
@@ -111,11 +115,19 @@ func (database wordDatabase) getRandomQuestion() question {
 	}
 }
 
+type mode int
+
+const (
+	input mode = iota
+	validation
+)
+
 type model struct {
 	database      *wordDatabase
 	question      question
 	inputField    textinput.Model
 	isInAltscreen bool
+	mode          mode
 }
 
 func initialModel() model {
@@ -128,11 +140,17 @@ func initialModel() model {
 		question:      question,
 		inputField:    inputField,
 		isInAltscreen: true,
+		mode:          input,
 	}
 }
 
 func (m model) Init() tea.Cmd {
 	return nil
+}
+
+func exitNonExistingMode() {
+	log.Println("[FATAL] Model is in a non-existing mode")
+	exit(internalError)
 }
 
 func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
@@ -144,6 +162,46 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, tea.Quit
 		case "ctrl+a":
 			return m.toggleAltScreen()
+		}
+	}
+	switch m.mode {
+	case input:
+		return m.inputUpdate(msg)
+	case validation:
+		return m.validateUpdate(msg)
+	default:
+		exitNonExistingMode()
+		return m, nil // unreachable
+	}
+}
+
+func (m model) inputUpdate(msg tea.Msg) (tea.Model, tea.Cmd) {
+	switch msg := msg.(type) {
+	case tea.KeyMsg:
+		switch msg.String() {
+		case "enter":
+			log.Println("[INFO] Answer submitted")
+			m.inputField.Blur() // Removes focus
+			m.mode = validation
+			return m, nil
+		}
+	}
+	var cmd tea.Cmd
+	m.inputField, cmd = m.inputField.Update(msg)
+	return m, cmd
+}
+
+func (m model) validateUpdate(msg tea.Msg) (tea.Model, tea.Cmd) {
+	switch msg := msg.(type) {
+	case tea.KeyMsg:
+		switch msg.String() {
+		case "enter":
+			log.Println("[INFO] New question requested")
+			m.question = m.database.getRandomQuestion()
+			m.inputField.Reset()
+			m.inputField.Focus() // Removes focus
+			m.mode = input
+			return m, nil
 		}
 	}
 	var cmd tea.Cmd
@@ -160,12 +218,46 @@ func (m *model) toggleAltScreen() (*model, tea.Cmd) {
 	}
 }
 
-func (m model) View() string {
+func (m model) validateAnswer() string {
+	answerIsCorrect := m.question.correct_answer == strings.TrimSpace(m.inputField.Value())
+	if answerIsCorrect {
+		return "Correct!"
+	} else {
+		return fmt.Sprintf("Wrong!\nCorrect answer is %s", m.question.correct_answer)
+	}
+}
+
+func (m model) inputView() string {
 	return lipgloss.JoinVertical(
 		lipgloss.Center,
 		m.question.format(),
 		m.inputField.View(),
+		"",
+		"enter to submit, esc/q to quit",
 	)
+}
+
+func (m model) validationView() string {
+	return lipgloss.JoinVertical(
+		lipgloss.Center,
+		m.question.format(),
+		m.inputField.View(),
+		"",
+		m.validateAnswer(),
+		"",
+		"enter to continue, esc/q to quit",
+	)
+}
+
+func (m model) View() string {
+	switch m.mode {
+	case input:
+		return m.inputView()
+	case validation:
+		return m.validationView()
+	}
+	exitNonExistingMode()
+	return "" // unreachable
 }
 
 func main() {
