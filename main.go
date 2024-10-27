@@ -112,9 +112,10 @@ func (database wordDatabase) getRandomQuestion() question {
 }
 
 type model struct {
-	database   *wordDatabase
-	question   question
-	inputField textinput.Model
+	database      *wordDatabase
+	question      question
+	inputField    textinput.Model
+	isInAltscreen bool
 }
 
 func initialModel() model {
@@ -123,9 +124,10 @@ func initialModel() model {
 	inputField := textinput.New()
 	inputField.Focus()
 	return model{
-		database:   &database,
-		question:   question,
-		inputField: inputField,
+		database:      &database,
+		question:      question,
+		inputField:    inputField,
+		isInAltscreen: true,
 	}
 }
 
@@ -140,11 +142,22 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		case "ctrl+c", "q", "esc":
 			log.Println("[INFO] Quitting...")
 			return m, tea.Quit
+		case "ctrl+a":
+			return m.toggleAltScreen()
 		}
 	}
 	var cmd tea.Cmd
 	m.inputField, cmd = m.inputField.Update(msg)
 	return m, cmd
+}
+
+func (m *model) toggleAltScreen() (*model, tea.Cmd) {
+	m.isInAltscreen = !m.isInAltscreen
+	if m.isInAltscreen {
+		return m, tea.EnterAltScreen
+	} else {
+		return m, tea.ExitAltScreen
+	}
 }
 
 func (m model) View() string {
@@ -164,7 +177,7 @@ func main() {
 	}
 
 	log.Println("[INFO] Starting app...")
-	p := tea.NewProgram(initialModel())
+	p := tea.NewProgram(initialModel(), tea.WithAltScreen())
 	log.Println("[INFO] Starting UI loop...")
 	if _, err := p.Run(); err != nil {
 		log.Printf("[FATAL] Program finished with error:\n%v", err)
