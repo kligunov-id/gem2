@@ -4,6 +4,7 @@ import (
 	"log"
 	"math/rand"
 	"os"
+	"strconv"
 	"strings"
 
 	"github.com/charmbracelet/bubbles/textinput"
@@ -118,11 +119,15 @@ const (
 )
 
 type model struct {
-	database      *wordDatabase
-	question      question
-	inputField    textinput.Model
+	// Screen stuff
+	database        *wordDatabase
+	mode            mode
+	question        question
+	inputField      textinput.Model
+	total_answers   int
+	correct_answers int
+	// Global stuff
 	isInAltscreen bool
-	mode          mode
 	height        int
 	width         int
 }
@@ -136,11 +141,13 @@ func initialModel() model {
 	inputField.Width = 15
 	inputField.CharLimit = 30
 	return model{
-		database:      &database,
-		question:      question,
-		inputField:    inputField,
-		isInAltscreen: true,
-		mode:          input,
+		database:        &database,
+		question:        question,
+		inputField:      inputField,
+		isInAltscreen:   true,
+		mode:            input,
+		total_answers:   0,
+		correct_answers: 0,
 	}
 }
 
@@ -185,6 +192,10 @@ func (m model) inputUpdate(msg tea.Msg) (tea.Model, tea.Cmd) {
 		switch msg.String() {
 		case "enter":
 			log.Println("[INFO] Answer submitted")
+			m.total_answers++
+			if m.isAnswerCorrect() {
+				m.correct_answers++
+			}
 			m.inputField.Blur() // Removes focus
 			m.mode = validation
 			return m, nil
@@ -222,13 +233,16 @@ func (m *model) toggleAltScreen() (*model, tea.Cmd) {
 	}
 }
 
-func (m model) validateAnswer() string {
-	answerIsCorrect := m.question.correct_answer == strings.TrimSpace(m.inputField.Value())
-	if answerIsCorrect {
+func (m model) isAnswerCorrect() bool {
+	return strings.TrimSpace(m.question.correct_answer) == strings.TrimSpace(m.inputField.Value())
+}
+
+func (m model) renderValidationRow() string {
+	if m.isAnswerCorrect() {
 		return correctAnswerStyle.Italic(true).Render("Correct!")
 	} else {
 		return wrongAnswerStyle.Render(
-			italic("Wrong!") + background.Render(" Correct answer is: ") + bold(m.question.correct_answer),
+			italic("Wrong!") + " Correct answer is: " + bold(m.question.correct_answer),
 		)
 	}
 }
@@ -261,8 +275,8 @@ var (
 				Foreground(lightPink1)
 	boxStyle = background.
 			Align(lipgloss.Left, lipgloss.Center).
-			PaddingTop(1).
-			PaddingBottom(1).
+			PaddingTop(0).
+			PaddingBottom(0).
 			PaddingLeft(3).
 			PaddingRight(3).
 			Width(45).
@@ -272,12 +286,46 @@ var (
 			BorderBackground(black)
 )
 
+// I could not find a way to inline
+// bold and italic tokens in lipgloss
+//
+// Applying style to a string that
+// had its parts modified by another style
+// (i.e. italic or bold styles)
+// would not work correctly since
+// inner styles would insert an \x1b]0m
+// that would reset _all_ the styling,
+// ruining the global string style
+//
+// That means that in lipgloss to
+// have three words rendered with the same style but
+// one bold, one normal and one intalic
+// you would have to do
+// strings.JoinSpace(
+//     style.Bold(true).Render(first),
+//     style.Render(second),
+//     style.Italic(true).Render(third),
+//)
+//
+// The helpers allow us to write that as
+// style.Render(strings.JoinSpace(bold(first), second, italic(third)))
+//
+// This also allows set Width on style
+// since we would no longer need to
+// apply the style to each token
+
+const csi = string('\x1b') + "["
+const BoldSequence = csi + "1m"
+const notBoldSequence = csi + "22m"
+const ItalicSequence = csi + "3m"
+const notItalicSequence = csi + "23m"
+
 func italic(s string) string {
-	return background.Italic(true).Render(s)
+	return ItalicSequence + s + notItalicSequence
 }
 
 func bold(s string) string {
-	return background.Bold(true).Render(s)
+	return BoldSequence + s + notBoldSequence
 }
 
 type helpEntry struct {
@@ -295,6 +343,21 @@ func renderHelpRow(entries []helpEntry) string {
 	}
 	help_row := strings.Join(rendered_entries, helpSeparator)
 	return lipgloss.NewStyle().Inline(true).Render(help_row)
+}
+
+func (m *model) renderStatsRow() string {
+	current_question := m.total_answers
+	if m.mode == input {
+		// The current one is unanswered
+		current_question++
+	}
+	statsStyle := background.Foreground(darkSeaGreen4)
+	return statsStyle.Render("Question " +
+		bold(strconv.Itoa(current_question)) +
+		". Correct answers: " +
+		bold(strconv.Itoa(m.correct_answers)) +
+		"/" +
+		bold(strconv.Itoa(m.total_answers)))
 }
 
 func (m model) renderQuestion() string {
@@ -325,6 +388,8 @@ var inputHelp = [...]helpEntry{
 func (m model) inputView() string {
 	return boxStyle.Render(lipgloss.JoinVertical(
 		lipgloss.Left,
+		m.renderStatsRow(),
+		"",
 		m.renderQuestion(),
 		"",
 		"",
@@ -341,9 +406,11 @@ var validationHelp = [...]helpEntry{
 func (m model) validationView() string {
 	return boxStyle.Render(lipgloss.JoinVertical(
 		lipgloss.Left,
+		m.renderStatsRow(),
+		"",
 		m.renderQuestion(),
 		"",
-		m.validateAnswer(),
+		m.renderValidationRow(),
 		"",
 		renderHelpRow(validationHelp[:]),
 	))
