@@ -1,6 +1,7 @@
 package main
 
 import (
+	"fmt"
 	"log"
 	"math/rand"
 	"os"
@@ -20,11 +21,12 @@ const (
 	// only new ones can be added
 	// This is also why we do not use iota here
 	// as this would prevent accidental renumbering
-	ok            exitCode = 0
-	databaseError exitCode = 1
-	loggingError  exitCode = 2
-	teaError      exitCode = 3
-	internalError exitCode = 4
+	ok                   exitCode = 0
+	databaseError        exitCode = 1
+	loggingError         exitCode = 2
+	teaError             exitCode = 3
+	internalError        exitCode = 4
+	mistakesLoggingError exitCode = 5
 )
 
 func exit(code exitCode) {
@@ -186,6 +188,25 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	}
 }
 
+func (m model) logMistake() {
+	f, err := os.OpenFile("mistakes", os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0666)
+	defer f.Close()
+	if err != nil {
+		log.Println("[ERROR] Failed to log mistake")
+		return
+	}
+	f.WriteString(
+		fmt.Sprintf(
+			"Question %s + %s:\n    Correct: %s\n    Answer: %s\n\n",
+			m.question.noun,
+			m.question.verb,
+			m.question.correct_answer,
+			m.inputField.Value(),
+		),
+	)
+	log.Println("[INFO] Logged mistake")
+}
+
 func (m model) inputUpdate(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
 	case tea.KeyMsg:
@@ -195,6 +216,8 @@ func (m model) inputUpdate(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.total_answers++
 			if m.isAnswerCorrect() {
 				m.correct_answers++
+			} else {
+				m.logMistake()
 			}
 			m.inputField.Blur() // Removes focus
 			m.mode = validation
