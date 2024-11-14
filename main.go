@@ -34,7 +34,7 @@ func exit(code exitCode) {
 }
 
 type wordDatabase struct {
-	pronouns  []string
+	formClue  []string
 	verbs     []string
 	verbForms [][]string
 }
@@ -89,28 +89,82 @@ func read_database() wordDatabase {
 	}
 }
 
-type question struct {
-	noun           string
-	verb           string
-	correct_answer string
+type questionStats struct {
+	streak uint16
 }
 
-func (database wordDatabase) getRandomQuestion() question {
-	var pronoun_index = rand.Intn(len(database.pronouns))
-	var verb_index = rand.Intn(len(database.verbs))
-	if len(database.verbForms[verb_index]) <= pronoun_index {
+func (stats questionStats) probWeight() float32 {
+	return 1 / (1 + float32(stats.streak))
+}
+
+type statisticsDatabase struct {
+	statistics      map[question]questionStats
+	totalProbWeight float32
+}
+
+func (statistics statisticsDatabase) updateStats(
+	question question,
+	newStats questionStats,
+) {
+	statistics.totalProbWeight -= statistics.statistics[question].probWeight()
+	statistics.statistics[question] = newStats
+	statistics.totalProbWeight += statistics.statistics[question].probWeight()
+}
+
+func (statistics statisticsDatabase) endStreak(question question) {
+	statistics.updateStats(question, questionStats{streak: 0})
+}
+
+func (statistics statisticsDatabase) continueStreak(question question) {
+	statistics.updateStats(
+		question,
+		questionStats{streak: statistics.statistics[question].streak + 1},
+	)
+}
+
+func (database wordDatabase) emptyStatistics() statisticsDatabase {
+	log.Printf("[INFO] Initializing statistics...\n")
+	statistics := make(map[question]questionStats)
+	var totalProbWeight float32 = 0
+	missing_fields_counter := 0
+	for verbIndex, verb := range database.verbs {
+		for clueIndex, clue := range database.formClue {
+			if len(database.verbForms[verbIndex]) <= clueIndex ||
+				database.verbForms[verbIndex][clueIndex] == "" {
+				missing_fields_counter++
+				continue
+			}
+			answer := database.verbForms[verbIndex][clueIndex]
+			statistics[question{clue, verb, answer}] = questionStats{streak: 0}
+			totalProbWeight++
+		}
+	}
+	if missing_fields_counter > 0 {
 		log.Printf(
-			"[WARNING] No database entry for \"%s\" + \"%s\"\n",
-			database.pronouns[pronoun_index],
-			database.verbs[verb_index],
+			"[WARNING] %d missing database fields\n",
+			missing_fields_counter,
 		)
-		return database.getRandomQuestion()
 	}
-	return question{
-		database.pronouns[pronoun_index],
-		database.verbs[verb_index],
-		database.verbForms[verb_index][pronoun_index],
+	log.Printf("[INFO] Finished initializing statistics\n")
+	return statisticsDatabase{statistics, totalProbWeight}
+}
+
+type question struct {
+	formClue      string
+	verb          string
+	correctAnswer string
+}
+
+func (statistics statisticsDatabase) getRandomQuestion() question {
+	random_float_index := rand.Float32() * statistics.totalProbWeight
+	for question, questionStats := range statistics.statistics {
+		random_float_index -= questionStats.probWeight()
+		if random_float_index <= 0 {
+			return question
+		}
 	}
+	log.Print("[WARNING] Random question selection floating arithmetic problem, recalculating...")
+	return statistics.getRandomQuestion()
 }
 
 type mode int
@@ -121,8 +175,8 @@ const (
 )
 
 type model struct {
+	statistics *statisticsDatabase
 	// Screen stuff
-	database        *wordDatabase
 	mode            mode
 	question        question
 	inputField      textinput.Model
@@ -136,14 +190,15 @@ type model struct {
 
 func initialModel() model {
 	database := read_database()
-	question := database.getRandomQuestion()
+	statistics := database.emptyStatistics()
+	question := statistics.getRandomQuestion()
 	inputField := textinput.New()
 	inputField.Focus()
 	inputField.Prompt = ""
 	inputField.Width = 15
 	inputField.CharLimit = 30
 	return model{
-		database:        &database,
+		statistics:      &statistics,
 		question:        question,
 		inputField:      inputField,
 		isInAltscreen:   true,
@@ -198,9 +253,9 @@ func (m model) logMistake() {
 	f.WriteString(
 		fmt.Sprintf(
 			"Question %s + %s:\n    Correct: %s\n    Answer: %s\n\n",
-			m.question.noun,
+			m.question.formClue,
 			m.question.verb,
-			m.question.correct_answer,
+			m.question.correctAnswer,
 			m.inputField.Value(),
 		),
 	)
@@ -212,12 +267,21 @@ func (m model) inputUpdate(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case tea.KeyMsg:
 		switch msg.String() {
 		case "enter":
-			log.Println("[INFO] Answer submitted")
 			m.total_answers++
 			if m.isAnswerCorrect() {
 				m.correct_answers++
+				m.statistics.continueStreak(m.question)
+				log.Printf(
+					"[INFO] Answer is correct, new score is %.2f\n",
+					m.statistics.statistics[m.question].probWeight(),
+				)
 			} else {
 				m.logMistake()
+				m.statistics.endStreak(m.question)
+				log.Printf(
+					"[INFO] Answer is wrong, new score is %.2f\n",
+					m.statistics.statistics[m.question].probWeight(),
+				)
 			}
 			m.inputField.Blur() // Removes focus
 			m.mode = validation
@@ -235,7 +299,7 @@ func (m model) validateUpdate(msg tea.Msg) (tea.Model, tea.Cmd) {
 		switch msg.String() {
 		case "enter":
 			log.Println("[INFO] New question requested")
-			m.question = m.database.getRandomQuestion()
+			m.question = m.statistics.getRandomQuestion()
 			m.inputField.Reset()
 			m.inputField.Focus() // Removes focus
 			m.mode = input
@@ -257,7 +321,7 @@ func (m *model) toggleAltScreen() (*model, tea.Cmd) {
 }
 
 func (m model) isAnswerCorrect() bool {
-	return strings.TrimSpace(m.question.correct_answer) == strings.TrimSpace(m.inputField.Value())
+	return strings.TrimSpace(m.question.correctAnswer) == strings.TrimSpace(m.inputField.Value())
 }
 
 func (m model) renderValidationRow() string {
@@ -265,7 +329,7 @@ func (m model) renderValidationRow() string {
 		return correctAnswerStyle.Italic(true).Render("Correct!")
 	} else {
 		return wrongAnswerStyle.Render(
-			italic("Wrong!") + " Correct answer is: " + bold(m.question.correct_answer),
+			italic("Wrong!") + " Correct answer is: " + bold(m.question.correctAnswer),
 		)
 	}
 }
@@ -392,7 +456,7 @@ func (m model) renderQuestion() string {
 	)
 	question_block := lipgloss.JoinVertical(
 		lipgloss.Left,
-		questionStyle.Render(m.question.noun),
+		questionStyle.Render(m.question.formClue),
 		questionStyle.Render(m.question.verb),
 		questionStyle.Render(m.inputField.View()),
 	)
