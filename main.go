@@ -90,7 +90,9 @@ func read_database() wordDatabase {
 }
 
 type questionStats struct {
-	streak uint16
+	streak   uint16
+	correct  uint16
+	mistakes uint16
 }
 
 func (stats questionStats) probWeight() float32 {
@@ -112,13 +114,18 @@ func (statistics statisticsDatabase) updateStats(
 }
 
 func (statistics statisticsDatabase) endStreak(question question) {
-	statistics.updateStats(question, questionStats{streak: 0})
+	oldStats := statistics.statistics[question]
+	statistics.updateStats(
+		question,
+		questionStats{streak: 0, correct: oldStats.correct, mistakes: oldStats.mistakes + 1},
+	)
 }
 
 func (statistics statisticsDatabase) continueStreak(question question) {
+	oldStats := statistics.statistics[question]
 	statistics.updateStats(
 		question,
-		questionStats{streak: statistics.statistics[question].streak + 1},
+		questionStats{streak: oldStats.streak + 1, correct: oldStats.correct + 1, mistakes: oldStats.mistakes},
 	)
 }
 
@@ -180,8 +187,9 @@ type model struct {
 	mode            mode
 	question        question
 	inputField      textinput.Model
-	total_answers   int
-	correct_answers int
+	wrong_answers   uint16
+	correct_answers uint16
+	streak          uint16
 	// Global stuff
 	isInAltscreen bool
 	height        int
@@ -203,7 +211,7 @@ func initialModel() model {
 		inputField:      inputField,
 		isInAltscreen:   true,
 		mode:            input,
-		total_answers:   0,
+		wrong_answers:   0,
 		correct_answers: 0,
 	}
 }
@@ -267,9 +275,9 @@ func (m model) inputUpdate(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case tea.KeyMsg:
 		switch msg.String() {
 		case "enter":
-			m.total_answers++
 			if m.isAnswerCorrect() {
 				m.correct_answers++
+				m.streak++
 				m.statistics.continueStreak(m.question)
 				log.Printf(
 					"[INFO] Answer is correct, new score is %.2f\n",
@@ -277,6 +285,8 @@ func (m model) inputUpdate(msg tea.Msg) (tea.Model, tea.Cmd) {
 				)
 			} else {
 				m.logMistake()
+				m.streak = 0
+				m.wrong_answers++
 				m.statistics.endStreak(m.question)
 				log.Printf(
 					"[INFO] Answer is wrong, new score is %.2f\n",
@@ -341,17 +351,26 @@ var (
 	darkSeaGreen1 = lipgloss.ANSIColor(193)
 	darkSeaGreen4 = lipgloss.ANSIColor(65)
 	darkSeaGreen2 = lipgloss.ANSIColor(157)
+	darkOrange    = lipgloss.ANSIColor(208)
+	darkOrange3   = lipgloss.ANSIColor(166)
+	salmon1       = lipgloss.ANSIColor(209)
+	lightSalmon3  = lipgloss.ANSIColor(173)
+	wheat4        = lipgloss.ANSIColor(101)
 	// Not using ANSI here since first 16 ones could be redefined
 	black = lipgloss.Color("#000000")
 )
 
 var (
-	background    = lipgloss.NewStyle().Background(black)
-	promptStyle   = background.Italic(true).Foreground(darkSeaGreen4)
-	questionStyle = background.Foreground(darkSeaGreen1).Width(45 - 14)
-	helpMsgStyle  = background.Foreground(lightPink4)
-	helpKeyStyle  = helpMsgStyle.Bold(true)
+	background         = lipgloss.NewStyle().Background(black)
+	promptStyle        = background.Italic(true).Foreground(darkSeaGreen4)
+	questionStatsStyle = background.Italic(true).Foreground(wheat4)
+	questionStyle      = background.Foreground(darkSeaGreen2).Width(45 - 14)
+	helpMsgStyle       = background.Foreground(lightPink4)
+	helpKeyStyle       = helpMsgStyle.Bold(true)
 
+	questionStatsAlignStyle = background.
+				AlignHorizontal(lipgloss.Center).
+				Width(39)
 	correctAnswerStyle = background.
 				AlignHorizontal(lipgloss.Center).
 				Width(39).
@@ -432,19 +451,28 @@ func renderHelpRow(entries []helpEntry) string {
 	return lipgloss.NewStyle().Inline(true).Render(help_row)
 }
 
-func (m *model) renderStatsRow() string {
-	current_question := m.total_answers
+func renderStatsTrisymbol(baseStyle lipgloss.Style, stats questionStats) string {
+	// questionStats probably would be changed for something like visibleStats
+	correctCounterStyle := baseStyle.Foreground(darkSeaGreen4)
+	mistakesCounterStyle := baseStyle.Foreground(lightPink4)
+	streakCounterStyle := baseStyle.Foreground(wheat4)
+	return correctCounterStyle.Render(strconv.Itoa(int(stats.correct))+" ● ") +
+		mistakesCounterStyle.Render(strconv.Itoa(int(stats.mistakes))+" ● ") +
+		streakCounterStyle.Render(strconv.Itoa(int(stats.streak))+" ●")
+}
+
+func (m *model) renderGlobalStatsRow() string {
+	current_question := int(m.correct_answers + m.wrong_answers)
 	if m.mode == input {
 		// The current one is unanswered
 		current_question++
 	}
 	statsStyle := background.Foreground(darkSeaGreen4)
-	return statsStyle.Render("Question " +
-		bold(strconv.Itoa(current_question)) +
-		". Correct answers: " +
-		bold(strconv.Itoa(m.correct_answers)) +
-		"/" +
-		bold(strconv.Itoa(m.total_answers)))
+	statsTrisymbol :=
+		renderStatsTrisymbol(statsStyle.Bold(true), questionStats{m.streak, m.correct_answers, m.wrong_answers})
+	return statsStyle.Width(39-lipgloss.Width(statsTrisymbol)).AlignHorizontal(lipgloss.Left).
+		Render("Question "+bold(strconv.Itoa(current_question))+".       ") +
+		statsTrisymbol
 }
 
 func (m model) renderQuestion() string {
@@ -472,14 +500,20 @@ var inputHelp = [...]helpEntry{
 	{bindings: []string{"esc", "q"}, action: "exit"},
 }
 
+func (m model) renderQuestionStatsRow() string {
+	return questionStatsAlignStyle.Render(questionStatsStyle.Render("[question stats: ") +
+		renderStatsTrisymbol(background.Italic(true), m.statistics.statistics[m.question]) +
+		questionStatsStyle.Render("]"))
+}
+
 func (m model) inputView() string {
 	return boxStyle.Render(lipgloss.JoinVertical(
 		lipgloss.Left,
-		m.renderStatsRow(),
+		m.renderGlobalStatsRow(),
 		"",
 		m.renderQuestion(),
 		"",
-		"",
+		m.renderQuestionStatsRow(),
 		"",
 		renderHelpRow(inputHelp[:]),
 	))
@@ -493,7 +527,7 @@ var validationHelp = [...]helpEntry{
 func (m model) validationView() string {
 	return boxStyle.Render(lipgloss.JoinVertical(
 		lipgloss.Left,
-		m.renderStatsRow(),
+		m.renderGlobalStatsRow(),
 		"",
 		m.renderQuestion(),
 		"",
