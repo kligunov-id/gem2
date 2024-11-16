@@ -308,7 +308,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil
 	case tea.KeyMsg:
 		switch msg.String() {
-		case "ctrl+c", "q", "esc":
+		case "ctrl+c", "esc":
 			log.Println("[INFO] Quitting...")
 			m.saveStatistics()
 			return m, tea.Quit
@@ -575,7 +575,7 @@ func (m model) renderQuestion() string {
 
 var inputHelp = [...]helpEntry{
 	{bindings: []string{"enter"}, action: "submit"},
-	{bindings: []string{"esc", "q"}, action: "exit"},
+	{bindings: []string{"esc", "ctrl+c"}, action: "exit"},
 }
 
 func (m model) renderQuestionStatsRow() string {
@@ -599,7 +599,7 @@ func (m model) inputView() string {
 
 var validationHelp = [...]helpEntry{
 	{bindings: []string{"enter"}, action: "continue"},
-	{bindings: []string{"esc", "q"}, action: "exit"},
+	{bindings: []string{"esc", "ctrl+c"}, action: "exit"},
 }
 
 func (m model) validationView() string {
