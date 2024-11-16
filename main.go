@@ -8,10 +8,11 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/charmbracelet/bubbles/textinput"
+	textinput "github.com/charmbracelet/bubbles/textinput"
 	tea "github.com/charmbracelet/bubbletea"
-	"github.com/charmbracelet/lipgloss"
-	"github.com/xuri/excelize/v2"
+	lipgloss "github.com/charmbracelet/lipgloss"
+	toml "github.com/pelletier/go-toml/v2"
+	excelize "github.com/xuri/excelize/v2"
 )
 
 type exitCode int
@@ -27,6 +28,7 @@ const (
 	teaError             exitCode = 3
 	internalError        exitCode = 4
 	mistakesLoggingError exitCode = 5
+	statisticsError      exitCode = 6
 )
 
 func exit(code exitCode) {
@@ -105,6 +107,72 @@ type statisticsDatabase struct {
 	totalProbWeight float32
 }
 
+const statisticsPromptSeparator = "+"
+
+func (prompt prompt) Encode() string {
+	return fmt.Sprintf("%s%s%s", prompt.formClue, statisticsPromptSeparator, prompt.Verb)
+}
+
+type promptDataTOML struct {
+	Streak   uint16
+	Correct  uint16
+	Mistakes uint16
+	Answer   string
+}
+
+type statisticsDatabaseTOML struct {
+	Statistics map[string]promptDataTOML
+}
+
+func (statisticsTOML statisticsDatabaseTOML) unpack() statisticsDatabase {
+	statistics := map[prompt]questionStats{}
+	answers := map[prompt]string{}
+	totalProbWeight := float32(0)
+	for encodedPrompt, data := range statisticsTOML.Statistics {
+		prompt_tokens := strings.Split(encodedPrompt, statisticsPromptSeparator)
+		if len(prompt_tokens) != 2 {
+			log.Printf("[FATAL] Invalid key \"%s\" in statistics file\n", encodedPrompt)
+			exit(statisticsError)
+		}
+		prompt := prompt{prompt_tokens[0], prompt_tokens[1]}
+		stats := questionStats{data.Streak, data.Correct, data.Mistakes}
+		statistics[prompt] = stats
+		answers[prompt] = data.Answer
+		totalProbWeight += stats.probWeight()
+	}
+	return statisticsDatabase{statistics, answers, totalProbWeight}
+}
+
+func (statisticsDatabase statisticsDatabase) pack() statisticsDatabaseTOML {
+	statistics := map[string]promptDataTOML{}
+	for prompt, stats := range statisticsDatabase.statistics {
+		if stats.correct == 0 && stats.mistakes == 0 {
+			continue
+		}
+		statistics[prompt.Encode()] = promptDataTOML{
+			stats.streak,
+			stats.correct,
+			stats.mistakes,
+			statisticsDatabase.answers[prompt],
+		}
+	}
+	return statisticsDatabaseTOML{statistics}
+}
+
+func (m model) saveStatistics() {
+	bytes, err := toml.Marshal(m.statistics.pack())
+	if err != nil {
+		log.Printf("[FATAL] Unachievable TOML encoding error\n")
+		exit(internalError)
+	}
+	err = os.WriteFile("statistics.toml", bytes, 0666)
+	if err != nil {
+		log.Printf("[FATAL] Could not write to statistics.toml\n")
+		exit(statisticsError)
+	}
+	log.Println("[INFO] Statistics saved")
+}
+
 func (statistics statisticsDatabase) updateStats(
 	prompt prompt,
 	newStats questionStats,
@@ -161,7 +229,7 @@ func (database wordDatabase) emptyStatistics() statisticsDatabase {
 
 type prompt struct {
 	formClue string
-	verb     string
+	Verb     string
 }
 
 type question struct {
@@ -191,12 +259,12 @@ const (
 type model struct {
 	statistics *statisticsDatabase
 	// Screen stuff
-	mode            mode
-	question        question
-	inputField      textinput.Model
-	wrong_answers   uint16
-	correct_answers uint16
-	streak          uint16
+	mode           mode
+	question       question
+	inputField     textinput.Model
+	wrongAnswers   uint16
+	correctAnswers uint16
+	streak         uint16
 	// Global stuff
 	isInAltscreen bool
 	height        int
@@ -213,13 +281,13 @@ func initialModel() model {
 	inputField.Width = 15
 	inputField.CharLimit = 30
 	return model{
-		statistics:      &statistics,
-		question:        question,
-		inputField:      inputField,
-		isInAltscreen:   true,
-		mode:            input,
-		wrong_answers:   0,
-		correct_answers: 0,
+		statistics:     &statistics,
+		question:       question,
+		inputField:     inputField,
+		isInAltscreen:  true,
+		mode:           input,
+		wrongAnswers:   0,
+		correctAnswers: 0,
 	}
 }
 
@@ -242,6 +310,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		switch msg.String() {
 		case "ctrl+c", "q", "esc":
 			log.Println("[INFO] Quitting...")
+			m.saveStatistics()
 			return m, tea.Quit
 		case "ctrl+a":
 			return m.toggleAltScreen()
@@ -269,7 +338,7 @@ func (m model) logMistake() {
 		fmt.Sprintf(
 			"Question %s + %s:\n    Correct: %s\n    Answer: %s\n\n",
 			m.question.prompt.formClue,
-			m.question.prompt.verb,
+			m.question.prompt.Verb,
 			m.question.correctAnswer,
 			m.inputField.Value(),
 		),
@@ -283,7 +352,7 @@ func (m model) inputUpdate(msg tea.Msg) (tea.Model, tea.Cmd) {
 		switch msg.String() {
 		case "enter":
 			if m.isAnswerCorrect() {
-				m.correct_answers++
+				m.correctAnswers++
 				m.streak++
 				m.statistics.continueStreak(m.question.prompt)
 				log.Printf(
@@ -293,7 +362,7 @@ func (m model) inputUpdate(msg tea.Msg) (tea.Model, tea.Cmd) {
 			} else {
 				m.logMistake()
 				m.streak = 0
-				m.wrong_answers++
+				m.wrongAnswers++
 				m.statistics.endStreak(m.question.prompt)
 				log.Printf(
 					"[INFO] Answer is wrong, new score is %.2f\n",
@@ -469,7 +538,7 @@ func renderStatsTrisymbol(baseStyle lipgloss.Style, stats questionStats) string 
 }
 
 func (m *model) renderGlobalStatsRow() string {
-	current_question := int(m.correct_answers + m.wrong_answers)
+	current_question := int(m.correctAnswers + m.wrongAnswers)
 	if m.mode == input {
 		// The current one is unanswered
 		current_question++
@@ -477,7 +546,7 @@ func (m *model) renderGlobalStatsRow() string {
 	statsStyle := background.Foreground(darkSeaGreen4)
 	statsTrisymbol := renderStatsTrisymbol(
 		statsStyle.Bold(true),
-		questionStats{m.streak, m.correct_answers, m.wrong_answers},
+		questionStats{m.streak, m.correctAnswers, m.wrongAnswers},
 	)
 	return statsStyle.Width(39-lipgloss.Width(statsTrisymbol)).AlignHorizontal(lipgloss.Left).
 		Render("Question "+bold(strconv.Itoa(current_question))+".       ") +
@@ -494,7 +563,7 @@ func (m model) renderQuestion() string {
 	question_block := lipgloss.JoinVertical(
 		lipgloss.Left,
 		questionStyle.Render(m.question.prompt.formClue),
-		questionStyle.Render(m.question.prompt.verb),
+		questionStyle.Render(m.question.prompt.Verb),
 		questionStyle.Render(m.inputField.View()),
 	)
 	return lipgloss.JoinHorizontal(
