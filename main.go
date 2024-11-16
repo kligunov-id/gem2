@@ -100,38 +100,40 @@ func (stats questionStats) probWeight() float32 {
 }
 
 type statisticsDatabase struct {
-	statistics      map[question]questionStats
+	statistics      map[prompt]questionStats
+	answers         map[prompt]string
 	totalProbWeight float32
 }
 
 func (statistics statisticsDatabase) updateStats(
-	question question,
+	prompt prompt,
 	newStats questionStats,
 ) {
-	statistics.totalProbWeight -= statistics.statistics[question].probWeight()
-	statistics.statistics[question] = newStats
-	statistics.totalProbWeight += statistics.statistics[question].probWeight()
+	statistics.totalProbWeight -= statistics.statistics[prompt].probWeight()
+	statistics.statistics[prompt] = newStats
+	statistics.totalProbWeight += statistics.statistics[prompt].probWeight()
 }
 
-func (statistics statisticsDatabase) endStreak(question question) {
-	oldStats := statistics.statistics[question]
+func (statistics statisticsDatabase) endStreak(prompt prompt) {
+	oldStats := statistics.statistics[prompt]
 	statistics.updateStats(
-		question,
+		prompt,
 		questionStats{streak: 0, correct: oldStats.correct, mistakes: oldStats.mistakes + 1},
 	)
 }
 
-func (statistics statisticsDatabase) continueStreak(question question) {
-	oldStats := statistics.statistics[question]
+func (statistics statisticsDatabase) continueStreak(prompt prompt) {
+	oldStats := statistics.statistics[prompt]
 	statistics.updateStats(
-		question,
+		prompt,
 		questionStats{streak: oldStats.streak + 1, correct: oldStats.correct + 1, mistakes: oldStats.mistakes},
 	)
 }
 
 func (database wordDatabase) emptyStatistics() statisticsDatabase {
 	log.Printf("[INFO] Initializing statistics...\n")
-	statistics := make(map[question]questionStats)
+	statistics := make(map[prompt]questionStats)
+	answers := make(map[prompt]string)
 	var totalProbWeight float32 = 0
 	missing_fields_counter := 0
 	for verbIndex, verb := range database.verbs {
@@ -142,7 +144,8 @@ func (database wordDatabase) emptyStatistics() statisticsDatabase {
 				continue
 			}
 			answer := database.verbForms[verbIndex][clueIndex]
-			statistics[question{clue, verb, answer}] = questionStats{streak: 0}
+			statistics[prompt{clue, verb}] = questionStats{}
+			answers[prompt{clue, verb}] = answer
 			totalProbWeight++
 		}
 	}
@@ -153,21 +156,25 @@ func (database wordDatabase) emptyStatistics() statisticsDatabase {
 		)
 	}
 	log.Printf("[INFO] Finished initializing statistics\n")
-	return statisticsDatabase{statistics, totalProbWeight}
+	return statisticsDatabase{statistics, answers, totalProbWeight}
+}
+
+type prompt struct {
+	formClue string
+	verb     string
 }
 
 type question struct {
-	formClue      string
-	verb          string
+	prompt        prompt
 	correctAnswer string
 }
 
 func (statistics statisticsDatabase) getRandomQuestion() question {
 	random_float_index := rand.Float32() * statistics.totalProbWeight
-	for question, questionStats := range statistics.statistics {
+	for prompt, questionStats := range statistics.statistics {
 		random_float_index -= questionStats.probWeight()
 		if random_float_index <= 0 {
-			return question
+			return question{prompt, statistics.answers[prompt]}
 		}
 	}
 	log.Print("[WARNING] Random question selection floating arithmetic problem, recalculating...")
@@ -261,8 +268,8 @@ func (m model) logMistake() {
 	f.WriteString(
 		fmt.Sprintf(
 			"Question %s + %s:\n    Correct: %s\n    Answer: %s\n\n",
-			m.question.formClue,
-			m.question.verb,
+			m.question.prompt.formClue,
+			m.question.prompt.verb,
 			m.question.correctAnswer,
 			m.inputField.Value(),
 		),
@@ -278,19 +285,19 @@ func (m model) inputUpdate(msg tea.Msg) (tea.Model, tea.Cmd) {
 			if m.isAnswerCorrect() {
 				m.correct_answers++
 				m.streak++
-				m.statistics.continueStreak(m.question)
+				m.statistics.continueStreak(m.question.prompt)
 				log.Printf(
 					"[INFO] Answer is correct, new score is %.2f\n",
-					m.statistics.statistics[m.question].probWeight(),
+					m.statistics.statistics[m.question.prompt].probWeight(),
 				)
 			} else {
 				m.logMistake()
 				m.streak = 0
 				m.wrong_answers++
-				m.statistics.endStreak(m.question)
+				m.statistics.endStreak(m.question.prompt)
 				log.Printf(
 					"[INFO] Answer is wrong, new score is %.2f\n",
-					m.statistics.statistics[m.question].probWeight(),
+					m.statistics.statistics[m.question.prompt].probWeight(),
 				)
 			}
 			m.inputField.Blur() // Removes focus
@@ -468,8 +475,10 @@ func (m *model) renderGlobalStatsRow() string {
 		current_question++
 	}
 	statsStyle := background.Foreground(darkSeaGreen4)
-	statsTrisymbol :=
-		renderStatsTrisymbol(statsStyle.Bold(true), questionStats{m.streak, m.correct_answers, m.wrong_answers})
+	statsTrisymbol := renderStatsTrisymbol(
+		statsStyle.Bold(true),
+		questionStats{m.streak, m.correct_answers, m.wrong_answers},
+	)
 	return statsStyle.Width(39-lipgloss.Width(statsTrisymbol)).AlignHorizontal(lipgloss.Left).
 		Render("Question "+bold(strconv.Itoa(current_question))+".       ") +
 		statsTrisymbol
@@ -484,8 +493,8 @@ func (m model) renderQuestion() string {
 	)
 	question_block := lipgloss.JoinVertical(
 		lipgloss.Left,
-		questionStyle.Render(m.question.formClue),
-		questionStyle.Render(m.question.verb),
+		questionStyle.Render(m.question.prompt.formClue),
+		questionStyle.Render(m.question.prompt.verb),
 		questionStyle.Render(m.inputField.View()),
 	)
 	return lipgloss.JoinHorizontal(
@@ -502,7 +511,7 @@ var inputHelp = [...]helpEntry{
 
 func (m model) renderQuestionStatsRow() string {
 	return questionStatsAlignStyle.Render(questionStatsStyle.Render("[question stats: ") +
-		renderStatsTrisymbol(background.Italic(true), m.statistics.statistics[m.question]) +
+		renderStatsTrisymbol(background.Italic(true), m.statistics.statistics[m.question.prompt]) +
 		questionStatsStyle.Render("]"))
 }
 
