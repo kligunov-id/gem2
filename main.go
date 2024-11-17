@@ -1,7 +1,9 @@
 package main
 
 import (
+	"errors"
 	"fmt"
+	"io/fs"
 	"log"
 	"math/rand"
 	"os"
@@ -35,6 +37,13 @@ func exit(code exitCode) {
 	os.Exit(int(code))
 }
 
+const (
+	wordDatabasePath = "words.xlsx"
+	logPath          = "log"
+	mistakesPath     = "mistakes"
+	statisticsPath   = "statistics.toml"
+)
+
 type wordDatabase struct {
 	formClue  []string
 	verbs     []string
@@ -42,7 +51,7 @@ type wordDatabase struct {
 }
 
 func read_database() wordDatabase {
-	table, err := excelize.OpenFile("./words.xlsx")
+	table, err := excelize.OpenFile(wordDatabasePath)
 	if err != nil {
 		log.Printf("[FATAL] %v\n", err)
 		exit(databaseError)
@@ -105,12 +114,24 @@ type statisticsDatabase struct {
 	statistics      map[prompt]questionStats
 	answers         map[prompt]string
 	totalProbWeight float32
+	// These are fields present in file
+	// yet not existing in word database
+	deadRecords map[string]promptDataTOML
 }
 
 const statisticsPromptSeparator = "+"
 
-func (prompt prompt) Encode() string {
+func (prompt prompt) encode() string {
 	return fmt.Sprintf("%s%s%s", prompt.formClue, statisticsPromptSeparator, prompt.Verb)
+}
+
+func decodePrompt(encodedPrompt string) prompt {
+	prompt_tokens := strings.Split(encodedPrompt, statisticsPromptSeparator)
+	if len(prompt_tokens) != 2 {
+		log.Printf("[FATAL] Invalid key \"%s\" in statistics file\n", encodedPrompt)
+		exit(statisticsError)
+	}
+	return prompt{prompt_tokens[0], prompt_tokens[1]}
 }
 
 type promptDataTOML struct {
@@ -124,32 +145,44 @@ type statisticsDatabaseTOML struct {
 	Statistics map[string]promptDataTOML
 }
 
-func (statisticsTOML statisticsDatabaseTOML) unpack() statisticsDatabase {
-	statistics := map[prompt]questionStats{}
-	answers := map[prompt]string{}
-	totalProbWeight := float32(0)
+func (statistics statisticsDatabase) expand(statisticsTOML statisticsDatabaseTOML) {
+	log.Println("[INFO] Updating statistics with content from file...")
+	resetRecordsCount := 0
 	for encodedPrompt, data := range statisticsTOML.Statistics {
-		prompt_tokens := strings.Split(encodedPrompt, statisticsPromptSeparator)
-		if len(prompt_tokens) != 2 {
-			log.Printf("[FATAL] Invalid key \"%s\" in statistics file\n", encodedPrompt)
-			exit(statisticsError)
+		prompt := decodePrompt(encodedPrompt)
+		_, exists := statistics.statistics[prompt]
+		if !exists {
+			statistics.deadRecords[encodedPrompt] = data
+			continue
 		}
-		prompt := prompt{prompt_tokens[0], prompt_tokens[1]}
+		if data.Answer != statistics.answers[prompt] {
+			resetRecordsCount++
+			continue
+		}
 		stats := questionStats{data.Streak, data.Correct, data.Mistakes}
-		statistics[prompt] = stats
-		answers[prompt] = data.Answer
-		totalProbWeight += stats.probWeight()
+		statistics.updateStats(prompt, stats)
 	}
-	return statisticsDatabase{statistics, answers, totalProbWeight}
+	if len(statistics.deadRecords) > 0 {
+		log.Printf(
+			"[INFO] %d questions no longer exist, ignoring statistics for them\n",
+			len(statistics.deadRecords),
+		)
+	}
+	if resetRecordsCount > 0 {
+		log.Printf(
+			"[WARNING] %d questions have their answer changed, resetting statistics for them\n",
+			resetRecordsCount,
+		)
+	}
 }
 
 func (statisticsDatabase statisticsDatabase) pack() statisticsDatabaseTOML {
-	statistics := map[string]promptDataTOML{}
+	statistics := statisticsDatabase.deadRecords
 	for prompt, stats := range statisticsDatabase.statistics {
 		if stats.correct == 0 && stats.mistakes == 0 {
 			continue
 		}
-		statistics[prompt.Encode()] = promptDataTOML{
+		statistics[prompt.encode()] = promptDataTOML{
 			stats.streak,
 			stats.correct,
 			stats.mistakes,
@@ -165,7 +198,7 @@ func (m model) saveStatistics() {
 		log.Printf("[FATAL] Unachievable TOML encoding error\n")
 		exit(internalError)
 	}
-	err = os.WriteFile("statistics.toml", bytes, 0666)
+	err = os.WriteFile(statisticsPath, bytes, 0666)
 	if err != nil {
 		log.Printf("[FATAL] Could not write to statistics.toml\n")
 		exit(statisticsError)
@@ -223,8 +256,29 @@ func (database wordDatabase) emptyStatistics() statisticsDatabase {
 			missing_fields_counter,
 		)
 	}
-	log.Printf("[INFO] Finished initializing statistics\n")
-	return statisticsDatabase{statistics, answers, totalProbWeight}
+	return statisticsDatabase{statistics, answers, totalProbWeight, map[string]promptDataTOML{}}
+}
+
+func (database wordDatabase) loadStatistics() statisticsDatabase {
+	statistics := database.emptyStatistics()
+	log.Printf("[INFO] Trying to read statistics file...")
+	bytes, err := os.ReadFile(statisticsPath)
+	if err != nil {
+		if errors.Is(err, fs.ErrNotExist) {
+			log.Println("[INFO] Statistics file not found")
+		} else {
+			log.Println("[ERROR] Failed to read statistics file")
+		}
+	} else {
+		var statisticsTOML statisticsDatabaseTOML
+		err = toml.Unmarshal(bytes, &statisticsTOML)
+		if err != nil {
+			log.Printf("[FATAL] Failed to parse TOML statistics file:\n %s \n", err)
+			exit(statisticsError)
+		}
+		statistics.expand(statisticsTOML)
+	}
+	return statistics
 }
 
 type prompt struct {
@@ -273,7 +327,7 @@ type model struct {
 
 func initialModel() model {
 	database := read_database()
-	statistics := database.emptyStatistics()
+	statistics := database.loadStatistics()
 	question := statistics.getRandomQuestion()
 	inputField := textinput.New()
 	inputField.Focus()
@@ -328,7 +382,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 }
 
 func (m model) logMistake() {
-	f, err := os.OpenFile("mistakes", os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0666)
+	f, err := os.OpenFile(mistakesPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0666)
 	defer f.Close()
 	if err != nil {
 		log.Println("[ERROR] Failed to log mistake")
@@ -637,7 +691,7 @@ func (m model) View() string {
 }
 
 func main() {
-	f, err := tea.LogToFile("log", "")
+	f, err := tea.LogToFile(logPath, "")
 	defer f.Close()
 	if err != nil {
 		log.Printf("[FATAL] %v\n", err)
