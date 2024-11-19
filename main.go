@@ -192,8 +192,8 @@ func (statisticsDatabase statisticsDatabase) pack() statisticsDatabaseTOML {
 	return statisticsDatabaseTOML{statistics}
 }
 
-func (m model) saveStatistics() {
-	bytes, err := toml.Marshal(m.statistics.pack())
+func (screen quizScreen) saveStatistics() {
+	bytes, err := toml.Marshal(screen.statistics.pack())
 	if err != nil {
 		log.Printf("[FATAL] Unachievable TOML encoding error\n")
 		exit(internalError)
@@ -311,18 +311,20 @@ const (
 )
 
 type model struct {
-	statistics *statisticsDatabase
-	// Screen stuff
+	screen        tea.Model
+	isInAltscreen bool
+	height        int
+	width         int
+}
+
+type quizScreen struct {
+	statistics     *statisticsDatabase
 	mode           mode
 	question       question
 	inputField     textinput.Model
 	wrongAnswers   uint16
 	correctAnswers uint16
 	streak         uint16
-	// Global stuff
-	isInAltscreen bool
-	height        int
-	width         int
 }
 
 func initialModel() model {
@@ -335,24 +337,33 @@ func initialModel() model {
 	inputField.Width = 15
 	inputField.CharLimit = 30
 	return model{
-		statistics:     &statistics,
-		question:       question,
-		inputField:     inputField,
-		isInAltscreen:  true,
-		mode:           input,
-		wrongAnswers:   0,
-		correctAnswers: 0,
+		screen: quizScreen{
+			statistics:     &statistics,
+			question:       question,
+			inputField:     inputField,
+			mode:           input,
+			wrongAnswers:   0,
+			correctAnswers: 0,
+		},
+		isInAltscreen: true,
 	}
 }
 
-func (m model) Init() tea.Cmd {
+func (screen quizScreen) Init() tea.Cmd {
 	return textinput.Blink
 }
 
+func (m model) Init() tea.Cmd {
+	return m.screen.Init()
+}
+
 func exitNonExistingMode() {
-	log.Println("[FATAL] Model is in a non-existing mode")
+	log.Println("[FATAL] Screen is in a non-existing mode")
 	exit(internalError)
 }
+
+type ExitScreenMessage struct{}
+type ScreenExitedMessage struct{}
 
 func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
@@ -364,24 +375,36 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		switch msg.String() {
 		case "ctrl+c", "esc":
 			log.Println("[INFO] Quitting...")
-			m.saveStatistics()
-			return m, tea.Quit
+			return m, func() tea.Msg { return ExitScreenMessage{} }
 		case "ctrl+a":
 			return m.toggleAltScreen()
 		}
+	case ScreenExitedMessage:
+		return m, tea.Quit
 	}
-	switch m.mode {
+	var cmd tea.Cmd
+	m.screen, cmd = m.screen.Update(msg)
+	return m, cmd
+}
+
+func (screen quizScreen) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
+	switch msg.(type) {
+	case ExitScreenMessage:
+		screen.saveStatistics()
+		return screen, func() tea.Msg { return ScreenExitedMessage{} }
+	}
+	switch screen.mode {
 	case input:
-		return m.inputUpdate(msg)
+		return screen.inputUpdate(msg)
 	case validation:
-		return m.validateUpdate(msg)
+		return screen.validateUpdate(msg)
 	default:
 		exitNonExistingMode()
-		return m, nil // unreachable
+		return screen, nil // unreachable
 	}
 }
 
-func (m model) logMistake() {
+func (screen quizScreen) logMistake() {
 	f, err := os.OpenFile(mistakesPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0666)
 	defer f.Close()
 	if err != nil {
@@ -391,64 +414,64 @@ func (m model) logMistake() {
 	f.WriteString(
 		fmt.Sprintf(
 			"Question %s + %s:\n    Correct: %s\n    Answer: %s\n\n",
-			m.question.prompt.formClue,
-			m.question.prompt.Verb,
-			m.question.correctAnswer,
-			m.inputField.Value(),
+			screen.question.prompt.formClue,
+			screen.question.prompt.Verb,
+			screen.question.correctAnswer,
+			screen.inputField.Value(),
 		),
 	)
 	log.Println("[INFO] Logged mistake")
 }
 
-func (m model) inputUpdate(msg tea.Msg) (tea.Model, tea.Cmd) {
+func (screen quizScreen) inputUpdate(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
 	case tea.KeyMsg:
 		switch msg.String() {
 		case "enter":
-			if m.isAnswerCorrect() {
-				m.correctAnswers++
-				m.streak++
-				m.statistics.continueStreak(m.question.prompt)
+			if screen.isAnswerCorrect() {
+				screen.correctAnswers++
+				screen.streak++
+				screen.statistics.continueStreak(screen.question.prompt)
 				log.Printf(
 					"[INFO] Answer is correct, new score is %.2f\n",
-					m.statistics.statistics[m.question.prompt].probWeight(),
+					screen.statistics.statistics[screen.question.prompt].probWeight(),
 				)
 			} else {
-				m.logMistake()
-				m.streak = 0
-				m.wrongAnswers++
-				m.statistics.endStreak(m.question.prompt)
+				screen.logMistake()
+				screen.streak = 0
+				screen.wrongAnswers++
+				screen.statistics.endStreak(screen.question.prompt)
 				log.Printf(
 					"[INFO] Answer is wrong, new score is %.2f\n",
-					m.statistics.statistics[m.question.prompt].probWeight(),
+					screen.statistics.statistics[screen.question.prompt].probWeight(),
 				)
 			}
-			m.inputField.Blur() // Removes focus
-			m.mode = validation
-			return m, nil
+			screen.inputField.Blur() // Removes focus
+			screen.mode = validation
+			return screen, nil
 		}
 	}
 	var cmd tea.Cmd
-	m.inputField, cmd = m.inputField.Update(msg)
-	return m, cmd
+	screen.inputField, cmd = screen.inputField.Update(msg)
+	return screen, cmd
 }
 
-func (m model) validateUpdate(msg tea.Msg) (tea.Model, tea.Cmd) {
+func (screen quizScreen) validateUpdate(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
 	case tea.KeyMsg:
 		switch msg.String() {
 		case "enter":
 			log.Println("[INFO] New question requested")
-			m.question = m.statistics.getRandomQuestion()
-			m.inputField.Reset()
-			m.inputField.Focus() // Removes focus
-			m.mode = input
-			return m, textinput.Blink
+			screen.question = screen.statistics.getRandomQuestion()
+			screen.inputField.Reset()
+			screen.inputField.Focus() // Removes focus
+			screen.mode = input
+			return screen, textinput.Blink
 		}
 	}
 	var cmd tea.Cmd
-	m.inputField, cmd = m.inputField.Update(msg)
-	return m, cmd
+	screen.inputField, cmd = screen.inputField.Update(msg)
+	return screen, cmd
 }
 
 func (m *model) toggleAltScreen() (*model, tea.Cmd) {
@@ -460,16 +483,16 @@ func (m *model) toggleAltScreen() (*model, tea.Cmd) {
 	}
 }
 
-func (m model) isAnswerCorrect() bool {
-	return strings.TrimSpace(m.question.correctAnswer) == strings.TrimSpace(m.inputField.Value())
+func (screen quizScreen) isAnswerCorrect() bool {
+	return strings.TrimSpace(screen.question.correctAnswer) == strings.TrimSpace(screen.inputField.Value())
 }
 
-func (m model) renderValidationRow() string {
-	if m.isAnswerCorrect() {
+func (screen quizScreen) renderValidationRow() string {
+	if screen.isAnswerCorrect() {
 		return correctAnswerStyle.Italic(true).Render("Correct!")
 	} else {
 		return wrongAnswerStyle.Render(
-			italic("Wrong!") + " Correct answer is: " + bold(m.question.correctAnswer),
+			italic("Wrong!") + " Correct answer is: " + bold(screen.question.correctAnswer),
 		)
 	}
 }
@@ -591,23 +614,23 @@ func renderStatsTrisymbol(baseStyle lipgloss.Style, stats questionStats) string 
 		streakCounterStyle.Render(strconv.Itoa(int(stats.streak))+" ●")
 }
 
-func (m *model) renderGlobalStatsRow() string {
-	current_question := int(m.correctAnswers + m.wrongAnswers)
-	if m.mode == input {
+func (screen quizScreen) renderGlobalStatsRow() string {
+	current_question := int(screen.correctAnswers + screen.wrongAnswers)
+	if screen.mode == input {
 		// The current one is unanswered
 		current_question++
 	}
 	statsStyle := background.Foreground(darkSeaGreen4)
 	statsTrisymbol := renderStatsTrisymbol(
 		statsStyle.Bold(true),
-		questionStats{m.streak, m.correctAnswers, m.wrongAnswers},
+		questionStats{screen.streak, screen.correctAnswers, screen.wrongAnswers},
 	)
 	return statsStyle.Width(39-lipgloss.Width(statsTrisymbol)).AlignHorizontal(lipgloss.Left).
 		Render("Question "+bold(strconv.Itoa(current_question))+".       ") +
 		statsTrisymbol
 }
 
-func (m model) renderQuestion() string {
+func (screen quizScreen) renderQuestion() string {
 	prompt_block := lipgloss.JoinVertical(
 		lipgloss.Right,
 		promptStyle.Render("Form Clue: "),
@@ -616,9 +639,9 @@ func (m model) renderQuestion() string {
 	)
 	question_block := lipgloss.JoinVertical(
 		lipgloss.Left,
-		questionStyle.Render(m.question.prompt.formClue),
-		questionStyle.Render(m.question.prompt.Verb),
-		questionStyle.Render(m.inputField.View()),
+		questionStyle.Render(screen.question.prompt.formClue),
+		questionStyle.Render(screen.question.prompt.Verb),
+		questionStyle.Render(screen.inputField.View()),
 	)
 	return lipgloss.JoinHorizontal(
 		lipgloss.Top,
@@ -632,20 +655,20 @@ var inputHelp = [...]helpEntry{
 	{bindings: []string{"esc", "ctrl+c"}, action: "exit"},
 }
 
-func (m model) renderQuestionStatsRow() string {
+func (screen quizScreen) renderQuestionStatsRow() string {
 	return questionStatsAlignStyle.Render(questionStatsStyle.Render("[question stats: ") +
-		renderStatsTrisymbol(background.Italic(true), m.statistics.statistics[m.question.prompt]) +
+		renderStatsTrisymbol(background.Italic(true), screen.statistics.statistics[screen.question.prompt]) +
 		questionStatsStyle.Render("]"))
 }
 
-func (m model) inputView() string {
+func (screen quizScreen) inputView() string {
 	return boxStyle.Render(lipgloss.JoinVertical(
 		lipgloss.Left,
-		m.renderGlobalStatsRow(),
+		screen.renderGlobalStatsRow(),
 		"",
-		m.renderQuestion(),
+		screen.renderQuestion(),
 		"",
-		m.renderQuestionStatsRow(),
+		screen.renderQuestionStatsRow(),
 		"",
 		renderHelpRow(inputHelp[:]),
 	))
@@ -656,30 +679,35 @@ var validationHelp = [...]helpEntry{
 	{bindings: []string{"esc", "ctrl+c"}, action: "exit"},
 }
 
-func (m model) validationView() string {
+func (screen quizScreen) validationView() string {
 	return boxStyle.Render(lipgloss.JoinVertical(
 		lipgloss.Left,
-		m.renderGlobalStatsRow(),
+		screen.renderGlobalStatsRow(),
 		"",
-		m.renderQuestion(),
+		screen.renderQuestion(),
 		"",
-		m.renderValidationRow(),
+		screen.renderValidationRow(),
 		"",
 		renderHelpRow(validationHelp[:]),
 	))
 }
 
-func (m model) View() string {
-	var content string
-	switch m.mode {
+func (screen quizScreen) View() string {
+	switch screen.mode {
 	case input:
-		content = m.inputView()
+		return screen.inputView()
 	case validation:
-		content = m.validationView()
-	default:
-		exitNonExistingMode()
+		return screen.validationView()
 	}
+	exitNonExistingMode()
+	return "" //unreachable
+}
+
+func (m model) View() string {
+	content := m.screen.View()
 	if !m.isInAltscreen {
+		// Terminal wants everything to end
+		// with explicit newline character
 		return content + "\n"
 	}
 	return lipgloss.NewStyle().
