@@ -414,6 +414,7 @@ func (screen quizScreen) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case tea.KeyMsg:
 		switch msg.String() {
 		case "ctrl+s":
+			screen.saveStatistics()
 			return statisticsScreen{
 				previousScreen:    &screen,
 				statistics:        screen.statistics,
