@@ -121,8 +121,18 @@ type statisticsDatabase struct {
 
 const statisticsPromptSeparator = "+"
 
+func (statistics statisticsDatabase) sortPromptsArbitraryOrder() []prompt {
+	orderedPromptList := make([]prompt, len(statistics.statistics))
+	i := 0
+	for prompt := range statistics.statistics {
+		orderedPromptList[i] = prompt
+		i++
+	}
+	return orderedPromptList
+}
+
 func (prompt prompt) encode() string {
-	return fmt.Sprintf("%s%s%s", prompt.formClue, statisticsPromptSeparator, prompt.Verb)
+	return fmt.Sprintf("%s%s%s", prompt.formClue, statisticsPromptSeparator, prompt.verb)
 }
 
 func decodePrompt(encodedPrompt string) prompt {
@@ -283,7 +293,7 @@ func (database wordDatabase) loadStatistics() statisticsDatabase {
 
 type prompt struct {
 	formClue string
-	Verb     string
+	verb     string
 }
 
 type question struct {
@@ -327,6 +337,14 @@ type quizScreen struct {
 	streak         uint16
 }
 
+type statisticsScreen struct {
+	previousScreen    *quizScreen
+	statistics        *statisticsDatabase
+	orderedPromptList []prompt
+	firstShownIndex   int
+	selectedRow       int
+}
+
 func initialModel() model {
 	database := read_database()
 	statistics := database.loadStatistics()
@@ -351,6 +369,10 @@ func initialModel() model {
 
 func (screen quizScreen) Init() tea.Cmd {
 	return textinput.Blink
+}
+
+func (screen statisticsScreen) Init() tea.Cmd {
+	return nil
 }
 
 func (m model) Init() tea.Cmd {
@@ -388,7 +410,18 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 }
 
 func (screen quizScreen) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
-	switch msg.(type) {
+	switch msg := msg.(type) {
+	case tea.KeyMsg:
+		switch msg.String() {
+		case "ctrl+s":
+			return statisticsScreen{
+				previousScreen:    &screen,
+				statistics:        screen.statistics,
+				orderedPromptList: screen.statistics.sortPromptsArbitraryOrder(),
+				firstShownIndex:   0,
+				selectedRow:       0,
+			}, nil
+		}
 	case ExitScreenMessage:
 		screen.saveStatistics()
 		return screen, func() tea.Msg { return ScreenExitedMessage{} }
@@ -404,6 +437,25 @@ func (screen quizScreen) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	}
 }
 
+func (screen statisticsScreen) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
+	switch msg := msg.(type) {
+	case ExitScreenMessage:
+		return screen, func() tea.Msg { return ScreenExitedMessage{} }
+	case tea.KeyMsg:
+		switch msg.String() {
+		case "ctrl+s", "backspace":
+			return screen.previousScreen, nil
+		case "j", "down":
+			screen.scrollDown()
+			return screen, nil
+		case "k", "up":
+			screen.scrollUp()
+			return screen, nil
+		}
+	}
+	return screen, nil
+}
+
 func (screen quizScreen) logMistake() {
 	f, err := os.OpenFile(mistakesPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0666)
 	defer f.Close()
@@ -415,7 +467,7 @@ func (screen quizScreen) logMistake() {
 		fmt.Sprintf(
 			"Question %s + %s:\n    Correct: %s\n    Answer: %s\n\n",
 			screen.question.prompt.formClue,
-			screen.question.prompt.Verb,
+			screen.question.prompt.verb,
 			screen.question.correctAnswer,
 			screen.inputField.Value(),
 		),
@@ -513,33 +565,45 @@ var (
 	black = lipgloss.Color("#000000")
 )
 
+const (
+	boxWidth          = 45
+	boxHeight         = 12
+	horizontalPadding = 3
+	verticalPadding   = 1
+	totalBoxWidth     = boxWidth + 2*horizontalPadding
+	totalBoxHeight    = boxHeight + 2*verticalPadding
+)
+
 var (
-	background         = lipgloss.NewStyle().Background(black)
-	promptStyle        = background.Italic(true).Foreground(darkSeaGreen4)
-	questionStatsStyle = background.Italic(true).Foreground(wheat4)
-	questionStyle      = background.Foreground(darkSeaGreen2).Width(45 - 14)
-	helpMsgStyle       = background.Foreground(lightPink4)
-	helpKeyStyle       = helpMsgStyle.Bold(true)
+	background            = lipgloss.NewStyle().Background(black)
+	promptStyle           = background.Italic(true).Foreground(darkSeaGreen4)
+	promptStatsEntryStyle = background.Italic(false).Foreground(darkSeaGreen4)
+	questionStatsStyle    = background.Italic(true).Foreground(wheat4)
+	questionStyle         = background.Foreground(darkSeaGreen2)
+	statsTitleStyle       = background.Foreground(darkSeaGreen4).Width(boxWidth)
+	helpMsgStyle          = background.Foreground(lightPink4)
+	helpKeyStyle          = helpMsgStyle.Bold(true)
 
 	questionStatsAlignStyle = background.
 				AlignHorizontal(lipgloss.Center).
-				Width(39)
+				Width(boxWidth)
 	correctAnswerStyle = background.
 				AlignHorizontal(lipgloss.Center).
-				Width(39).
+				Width(boxWidth).
 				Foreground(darkSeaGreen2)
 	wrongAnswerStyle = background.
 				AlignHorizontal(lipgloss.Center).
-				Width(39).
+				Width(boxWidth).
 				Foreground(lightPink1)
 	boxStyle = background.
 			Align(lipgloss.Left, lipgloss.Center).
 			PaddingTop(0).
 			PaddingBottom(0).
-			PaddingLeft(3).
-			PaddingRight(3).
-			Width(45).
-			Height(9).
+			PaddingLeft(horizontalPadding).
+			PaddingTop(verticalPadding).
+			PaddingBottom(verticalPadding).
+			Width(totalBoxWidth).
+			Height(totalBoxHeight).
 			BorderStyle(lipgloss.RoundedBorder()).
 			BorderForeground(lightPink4).
 			BorderBackground(black)
@@ -625,23 +689,32 @@ func (screen quizScreen) renderGlobalStatsRow() string {
 		statsStyle.Bold(true),
 		questionStats{screen.streak, screen.correctAnswers, screen.wrongAnswers},
 	)
-	return statsStyle.Width(39-lipgloss.Width(statsTrisymbol)).AlignHorizontal(lipgloss.Left).
+	return statsStyle.Width(boxWidth-lipgloss.Width(statsTrisymbol)).AlignHorizontal(lipgloss.Left).
 		Render("Question "+bold(strconv.Itoa(current_question))+".       ") +
 		statsTrisymbol
 }
 
 func (screen quizScreen) renderQuestion() string {
-	prompt_block := lipgloss.JoinVertical(
-		lipgloss.Right,
+	prompts := []string{
 		promptStyle.Render("Form Clue: "),
 		promptStyle.Render("Verb: "),
 		promptStyle.Render("Verb Form: "),
+	}
+	prompt_block := lipgloss.JoinVertical(
+		lipgloss.Right,
+		prompts...,
 	)
+	maxlen := 0
+	for _, prompt := range prompts {
+		maxlen = max(maxlen, lipgloss.Width(prompt))
+	}
+	questionBlockWidth := boxWidth - maxlen
+	questionBoxStyle := questionStyle.Width(questionBlockWidth)
 	question_block := lipgloss.JoinVertical(
 		lipgloss.Left,
-		questionStyle.Render(screen.question.prompt.formClue),
-		questionStyle.Render(screen.question.prompt.Verb),
-		questionStyle.Render(screen.inputField.View()),
+		questionBoxStyle.Render(screen.question.prompt.formClue),
+		questionBoxStyle.Render(screen.question.prompt.verb),
+		questionBoxStyle.Render(screen.inputField.View()),
 	)
 	return lipgloss.JoinHorizontal(
 		lipgloss.Top,
@@ -652,7 +725,8 @@ func (screen quizScreen) renderQuestion() string {
 
 var inputHelp = [...]helpEntry{
 	{bindings: []string{"enter"}, action: "submit"},
-	{bindings: []string{"esc", "ctrl+c"}, action: "exit"},
+	{bindings: []string{"ctrl+s"}, action: "stats"},
+	{bindings: []string{"esc"}, action: "exit"},
 }
 
 func (screen quizScreen) renderQuestionStatsRow() string {
@@ -662,34 +736,123 @@ func (screen quizScreen) renderQuestionStatsRow() string {
 }
 
 func (screen quizScreen) inputView() string {
-	return boxStyle.Render(lipgloss.JoinVertical(
+	body := lipgloss.JoinVertical(
 		lipgloss.Left,
 		screen.renderGlobalStatsRow(),
 		"",
 		screen.renderQuestion(),
 		"",
-		screen.renderQuestionStatsRow(),
 		"",
-		renderHelpRow(inputHelp[:]),
-	))
+		screen.renderQuestionStatsRow(),
+	)
+	footer := renderHelpRow(inputHelp[:])
+	spacing := boxHeight - lipgloss.Height(body) - lipgloss.Height(footer)
+	content := body + strings.Repeat("\n", spacing+1) + footer
+	return boxStyle.Render(content)
 }
 
 var validationHelp = [...]helpEntry{
-	{bindings: []string{"enter"}, action: "continue"},
-	{bindings: []string{"esc", "ctrl+c"}, action: "exit"},
+	{bindings: []string{"enter"}, action: "next"},
+	{bindings: []string{"ctrl+s"}, action: "stats"},
+	{bindings: []string{"esc"}, action: "exit"},
 }
 
 func (screen quizScreen) validationView() string {
-	return boxStyle.Render(lipgloss.JoinVertical(
+	footer := renderHelpRow(validationHelp[:])
+	body := lipgloss.JoinVertical(
 		lipgloss.Left,
 		screen.renderGlobalStatsRow(),
 		"",
 		screen.renderQuestion(),
 		"",
-		screen.renderValidationRow(),
 		"",
-		renderHelpRow(validationHelp[:]),
-	))
+		screen.renderValidationRow(),
+	)
+	spacing := boxHeight - lipgloss.Height(body) - lipgloss.Height(footer)
+	content := body + strings.Repeat("\n", spacing+1) + footer
+	return boxStyle.Render(content)
+}
+
+func (screen statisticsScreen) renderStatEntry(prompt prompt, selected bool) string {
+	statsTrisymbol := renderStatsTrisymbol(
+		background.Bold(selected).Italic(selected),
+		screen.statistics.statistics[prompt],
+	)
+	if selected {
+		bracketStyle := background.Italic(true).Foreground(wheat4)
+		statsTrisymbol = bracketStyle.Render("[") + statsTrisymbol + bracketStyle.Render("]")
+	} else {
+		statsTrisymbol += background.Render(" ")
+	}
+	promptFormated := fmt.Sprintf("%s + %s", prompt.formClue, prompt.verb)
+	if selected {
+		promptFormated = "> " + promptFormated
+	}
+	return promptStatsEntryStyle.
+		Bold(selected).
+		Italic(selected).
+		Width(boxWidth-lipgloss.Width(statsTrisymbol)).
+		AlignHorizontal(lipgloss.Left).
+		Render(promptFormated) +
+		statsTrisymbol
+}
+
+var statisticsScreenHelp = [...]helpEntry{
+	{bindings: []string{"k", "↑"}, action: "up"},
+	{bindings: []string{"j", "↓"}, action: "down"},
+	{bindings: []string{"backspace"}, action: "back"},
+	{bindings: []string{"esc"}, action: "exit"},
+}
+
+func (screen *statisticsScreen) scrollDown() {
+	keepOnScreen := 2
+	shownRows := boxHeight - 2 - 2
+	if screen.selectedRow < shownRows-keepOnScreen-1 {
+		screen.selectedRow++
+		return
+	}
+	if screen.firstShownIndex+shownRows < len(screen.orderedPromptList) {
+		screen.firstShownIndex++
+	} else if screen.selectedRow < shownRows-1 {
+		screen.selectedRow++
+	}
+}
+
+func (screen *statisticsScreen) scrollUp() {
+	keepOnScreen := 2
+	if screen.selectedRow > keepOnScreen {
+		screen.selectedRow--
+		return
+	}
+	if screen.firstShownIndex > 0 {
+		screen.firstShownIndex--
+	} else if screen.selectedRow > 0 {
+		screen.selectedRow--
+	}
+}
+
+func (screen statisticsScreen) View() string {
+	footer := renderHelpRow(statisticsScreenHelp[:])
+	renderedLines := []string{statsTitleStyle.Render("Statistics"), ""}
+	shownRows := boxHeight - 2 - 2
+	for row := 0; row < shownRows; row++ {
+		promptIndex := screen.firstShownIndex + row
+		if promptIndex >= len(screen.orderedPromptList) {
+			break
+		}
+		entryPrompt := screen.orderedPromptList[promptIndex]
+		renderedLines = append(renderedLines, screen.renderStatEntry(
+			entryPrompt,
+			row == screen.selectedRow,
+		))
+	}
+	body := lipgloss.JoinVertical(
+		lipgloss.Left,
+		renderedLines...,
+	)
+	spacing := boxHeight - lipgloss.Height(body) - lipgloss.Height(footer)
+	content := body + strings.Repeat("\n", spacing+1) + footer
+	return boxStyle.Render(content)
 }
 
 func (screen quizScreen) View() string {
