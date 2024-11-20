@@ -1,5 +1,7 @@
-# Log file
+# Log files
 log
+mistakes
+statistics.toml
 
 # Executables
 gem2.exe

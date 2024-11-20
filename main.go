@@ -1,16 +1,20 @@
 package main
 
 import (
+	"errors"
+	"fmt"
+	"io/fs"
 	"log"
 	"math/rand"
 	"os"
 	"strconv"
 	"strings"
 
-	"github.com/charmbracelet/bubbles/textinput"
+	textinput "github.com/charmbracelet/bubbles/textinput"
 	tea "github.com/charmbracelet/bubbletea"
-	"github.com/charmbracelet/lipgloss"
-	"github.com/xuri/excelize/v2"
+	lipgloss "github.com/charmbracelet/lipgloss"
+	toml "github.com/pelletier/go-toml/v2"
+	excelize "github.com/xuri/excelize/v2"
 )
 
 type exitCode int
@@ -20,25 +24,34 @@ const (
 	// only new ones can be added
 	// This is also why we do not use iota here
 	// as this would prevent accidental renumbering
-	ok            exitCode = 0
-	databaseError exitCode = 1
-	loggingError  exitCode = 2
-	teaError      exitCode = 3
-	internalError exitCode = 4
+	ok                   exitCode = 0
+	databaseError        exitCode = 1
+	loggingError         exitCode = 2
+	teaError             exitCode = 3
+	internalError        exitCode = 4
+	mistakesLoggingError exitCode = 5
+	statisticsError      exitCode = 6
 )
 
 func exit(code exitCode) {
 	os.Exit(int(code))
 }
 
+const (
+	wordDatabasePath = "words.xlsx"
+	logPath          = "log"
+	mistakesPath     = "mistakes"
+	statisticsPath   = "statistics.toml"
+)
+
 type wordDatabase struct {
-	pronouns  []string
+	formClue  []string
 	verbs     []string
 	verbForms [][]string
 }
 
 func read_database() wordDatabase {
-	table, err := excelize.OpenFile("./words.xlsx")
+	table, err := excelize.OpenFile(wordDatabasePath)
 	if err != nil {
 		log.Printf("[FATAL] %v\n", err)
 		exit(databaseError)
@@ -87,28 +100,217 @@ func read_database() wordDatabase {
 	}
 }
 
-type question struct {
-	noun           string
-	verb           string
-	correct_answer string
+type questionStats struct {
+	streak   uint16
+	correct  uint16
+	mistakes uint16
 }
 
-func (database wordDatabase) getRandomQuestion() question {
-	var pronoun_index = rand.Intn(len(database.pronouns))
-	var verb_index = rand.Intn(len(database.verbs))
-	if len(database.verbForms[verb_index]) <= pronoun_index {
+func (stats questionStats) probWeight() float32 {
+	return 1 / (1 + float32(stats.streak))
+}
+
+type statisticsDatabase struct {
+	statistics      map[prompt]questionStats
+	answers         map[prompt]string
+	totalProbWeight float32
+	// These are fields present in file
+	// yet not existing in word database
+	deadRecords map[string]promptDataTOML
+}
+
+const statisticsPromptSeparator = "+"
+
+func (statistics statisticsDatabase) sortPromptsArbitraryOrder() []prompt {
+	orderedPromptList := make([]prompt, len(statistics.statistics))
+	i := 0
+	for prompt := range statistics.statistics {
+		orderedPromptList[i] = prompt
+		i++
+	}
+	return orderedPromptList
+}
+
+func (prompt prompt) encode() string {
+	return fmt.Sprintf("%s%s%s", prompt.formClue, statisticsPromptSeparator, prompt.verb)
+}
+
+func decodePrompt(encodedPrompt string) prompt {
+	prompt_tokens := strings.Split(encodedPrompt, statisticsPromptSeparator)
+	if len(prompt_tokens) != 2 {
+		log.Printf("[FATAL] Invalid key \"%s\" in statistics file\n", encodedPrompt)
+		exit(statisticsError)
+	}
+	return prompt{prompt_tokens[0], prompt_tokens[1]}
+}
+
+type promptDataTOML struct {
+	Streak   uint16
+	Correct  uint16
+	Mistakes uint16
+	Answer   string
+}
+
+type statisticsDatabaseTOML struct {
+	Statistics map[string]promptDataTOML
+}
+
+func (statistics statisticsDatabase) expand(statisticsTOML statisticsDatabaseTOML) {
+	log.Println("[INFO] Updating statistics with content from file...")
+	resetRecordsCount := 0
+	for encodedPrompt, data := range statisticsTOML.Statistics {
+		prompt := decodePrompt(encodedPrompt)
+		_, exists := statistics.statistics[prompt]
+		if !exists {
+			statistics.deadRecords[encodedPrompt] = data
+			continue
+		}
+		if data.Answer != statistics.answers[prompt] {
+			resetRecordsCount++
+			continue
+		}
+		stats := questionStats{data.Streak, data.Correct, data.Mistakes}
+		statistics.updateStats(prompt, stats)
+	}
+	if len(statistics.deadRecords) > 0 {
 		log.Printf(
-			"[WARNING] No database entry for \"%s\" + \"%s\"\n",
-			database.pronouns[pronoun_index],
-			database.verbs[verb_index],
+			"[INFO] %d questions no longer exist, ignoring statistics for them\n",
+			len(statistics.deadRecords),
 		)
-		return database.getRandomQuestion()
 	}
-	return question{
-		database.pronouns[pronoun_index],
-		database.verbs[verb_index],
-		database.verbForms[verb_index][pronoun_index],
+	if resetRecordsCount > 0 {
+		log.Printf(
+			"[WARNING] %d questions have their answer changed, resetting statistics for them\n",
+			resetRecordsCount,
+		)
 	}
+}
+
+func (statisticsDatabase statisticsDatabase) pack() statisticsDatabaseTOML {
+	statistics := statisticsDatabase.deadRecords
+	for prompt, stats := range statisticsDatabase.statistics {
+		if stats.correct == 0 && stats.mistakes == 0 {
+			continue
+		}
+		statistics[prompt.encode()] = promptDataTOML{
+			stats.streak,
+			stats.correct,
+			stats.mistakes,
+			statisticsDatabase.answers[prompt],
+		}
+	}
+	return statisticsDatabaseTOML{statistics}
+}
+
+func (screen quizScreen) saveStatistics() {
+	bytes, err := toml.Marshal(screen.statistics.pack())
+	if err != nil {
+		log.Printf("[FATAL] Unachievable TOML encoding error\n")
+		exit(internalError)
+	}
+	err = os.WriteFile(statisticsPath, bytes, 0666)
+	if err != nil {
+		log.Printf("[FATAL] Could not write to statistics.toml\n")
+		exit(statisticsError)
+	}
+	log.Println("[INFO] Statistics saved")
+}
+
+func (statistics statisticsDatabase) updateStats(
+	prompt prompt,
+	newStats questionStats,
+) {
+	statistics.totalProbWeight -= statistics.statistics[prompt].probWeight()
+	statistics.statistics[prompt] = newStats
+	statistics.totalProbWeight += statistics.statistics[prompt].probWeight()
+}
+
+func (statistics statisticsDatabase) endStreak(prompt prompt) {
+	oldStats := statistics.statistics[prompt]
+	statistics.updateStats(
+		prompt,
+		questionStats{streak: 0, correct: oldStats.correct, mistakes: oldStats.mistakes + 1},
+	)
+}
+
+func (statistics statisticsDatabase) continueStreak(prompt prompt) {
+	oldStats := statistics.statistics[prompt]
+	statistics.updateStats(
+		prompt,
+		questionStats{streak: oldStats.streak + 1, correct: oldStats.correct + 1, mistakes: oldStats.mistakes},
+	)
+}
+
+func (database wordDatabase) emptyStatistics() statisticsDatabase {
+	log.Printf("[INFO] Initializing statistics...\n")
+	statistics := make(map[prompt]questionStats)
+	answers := make(map[prompt]string)
+	var totalProbWeight float32 = 0
+	missing_fields_counter := 0
+	for verbIndex, verb := range database.verbs {
+		for clueIndex, clue := range database.formClue {
+			if len(database.verbForms[verbIndex]) <= clueIndex ||
+				database.verbForms[verbIndex][clueIndex] == "" {
+				missing_fields_counter++
+				continue
+			}
+			answer := database.verbForms[verbIndex][clueIndex]
+			statistics[prompt{clue, verb}] = questionStats{}
+			answers[prompt{clue, verb}] = answer
+			totalProbWeight++
+		}
+	}
+	if missing_fields_counter > 0 {
+		log.Printf(
+			"[WARNING] %d missing database fields\n",
+			missing_fields_counter,
+		)
+	}
+	return statisticsDatabase{statistics, answers, totalProbWeight, map[string]promptDataTOML{}}
+}
+
+func (database wordDatabase) loadStatistics() statisticsDatabase {
+	statistics := database.emptyStatistics()
+	log.Printf("[INFO] Trying to read statistics file...")
+	bytes, err := os.ReadFile(statisticsPath)
+	if err != nil {
+		if errors.Is(err, fs.ErrNotExist) {
+			log.Println("[INFO] Statistics file not found")
+		} else {
+			log.Println("[ERROR] Failed to read statistics file")
+		}
+	} else {
+		var statisticsTOML statisticsDatabaseTOML
+		err = toml.Unmarshal(bytes, &statisticsTOML)
+		if err != nil {
+			log.Printf("[FATAL] Failed to parse TOML statistics file:\n %s \n", err)
+			exit(statisticsError)
+		}
+		statistics.expand(statisticsTOML)
+	}
+	return statistics
+}
+
+type prompt struct {
+	formClue string
+	verb     string
+}
+
+type question struct {
+	prompt        prompt
+	correctAnswer string
+}
+
+func (statistics statisticsDatabase) getRandomQuestion() question {
+	random_float_index := rand.Float32() * statistics.totalProbWeight
+	for prompt, questionStats := range statistics.statistics {
+		random_float_index -= questionStats.probWeight()
+		if random_float_index <= 0 {
+			return question{prompt, statistics.answers[prompt]}
+		}
+	}
+	log.Print("[WARNING] Random question selection floating arithmetic problem, recalculating...")
+	return statistics.getRandomQuestion()
 }
 
 type mode int
@@ -119,46 +321,71 @@ const (
 )
 
 type model struct {
-	// Screen stuff
-	database        *wordDatabase
-	mode            mode
-	question        question
-	inputField      textinput.Model
-	total_answers   int
-	correct_answers int
-	// Global stuff
+	screen        tea.Model
 	isInAltscreen bool
 	height        int
 	width         int
 }
 
+type quizScreen struct {
+	statistics     *statisticsDatabase
+	mode           mode
+	question       question
+	inputField     textinput.Model
+	wrongAnswers   uint16
+	correctAnswers uint16
+	streak         uint16
+}
+
+type statisticsScreen struct {
+	previousScreen    *quizScreen
+	statistics        *statisticsDatabase
+	orderedPromptList []prompt
+	firstShownIndex   int
+	selectedRow       int
+}
+
 func initialModel() model {
 	database := read_database()
-	question := database.getRandomQuestion()
+	statistics := database.loadStatistics()
+	question := statistics.getRandomQuestion()
 	inputField := textinput.New()
 	inputField.Focus()
 	inputField.Prompt = ""
 	inputField.Width = 15
 	inputField.CharLimit = 30
 	return model{
-		database:        &database,
-		question:        question,
-		inputField:      inputField,
-		isInAltscreen:   true,
-		mode:            input,
-		total_answers:   0,
-		correct_answers: 0,
+		screen: quizScreen{
+			statistics:     &statistics,
+			question:       question,
+			inputField:     inputField,
+			mode:           input,
+			wrongAnswers:   0,
+			correctAnswers: 0,
+		},
+		isInAltscreen: true,
 	}
 }
 
-func (m model) Init() tea.Cmd {
+func (screen quizScreen) Init() tea.Cmd {
 	return textinput.Blink
 }
 
+func (screen statisticsScreen) Init() tea.Cmd {
+	return nil
+}
+
+func (m model) Init() tea.Cmd {
+	return m.screen.Init()
+}
+
 func exitNonExistingMode() {
-	log.Println("[FATAL] Model is in a non-existing mode")
+	log.Println("[FATAL] Screen is in a non-existing mode")
 	exit(internalError)
 }
+
+type ExitScreenMessage struct{}
+type ScreenExitedMessage struct{}
 
 func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
@@ -168,60 +395,135 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil
 	case tea.KeyMsg:
 		switch msg.String() {
-		case "ctrl+c", "q", "esc":
+		case "ctrl+c", "esc":
 			log.Println("[INFO] Quitting...")
-			return m, tea.Quit
+			return m, func() tea.Msg { return ExitScreenMessage{} }
 		case "ctrl+a":
 			return m.toggleAltScreen()
 		}
+	case ScreenExitedMessage:
+		return m, tea.Quit
 	}
-	switch m.mode {
+	var cmd tea.Cmd
+	m.screen, cmd = m.screen.Update(msg)
+	return m, cmd
+}
+
+func (screen quizScreen) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
+	switch msg := msg.(type) {
+	case tea.KeyMsg:
+		switch msg.String() {
+		case "ctrl+s":
+			return statisticsScreen{
+				previousScreen:    &screen,
+				statistics:        screen.statistics,
+				orderedPromptList: screen.statistics.sortPromptsArbitraryOrder(),
+				firstShownIndex:   0,
+				selectedRow:       0,
+			}, nil
+		}
+	case ExitScreenMessage:
+		screen.saveStatistics()
+		return screen, func() tea.Msg { return ScreenExitedMessage{} }
+	}
+	switch screen.mode {
 	case input:
-		return m.inputUpdate(msg)
+		return screen.inputUpdate(msg)
 	case validation:
-		return m.validateUpdate(msg)
+		return screen.validateUpdate(msg)
 	default:
 		exitNonExistingMode()
-		return m, nil // unreachable
+		return screen, nil // unreachable
 	}
 }
 
-func (m model) inputUpdate(msg tea.Msg) (tea.Model, tea.Cmd) {
+func (screen statisticsScreen) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
+	switch msg := msg.(type) {
+	case ExitScreenMessage:
+		return screen, func() tea.Msg { return ScreenExitedMessage{} }
+	case tea.KeyMsg:
+		switch msg.String() {
+		case "ctrl+s", "backspace":
+			return screen.previousScreen, nil
+		case "j", "down":
+			screen.scrollDown()
+			return screen, nil
+		case "k", "up":
+			screen.scrollUp()
+			return screen, nil
+		}
+	}
+	return screen, nil
+}
+
+func (screen quizScreen) logMistake() {
+	f, err := os.OpenFile(mistakesPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0666)
+	defer f.Close()
+	if err != nil {
+		log.Println("[ERROR] Failed to log mistake")
+		return
+	}
+	f.WriteString(
+		fmt.Sprintf(
+			"Question %s + %s:\n    Correct: %s\n    Answer: %s\n\n",
+			screen.question.prompt.formClue,
+			screen.question.prompt.verb,
+			screen.question.correctAnswer,
+			screen.inputField.Value(),
+		),
+	)
+	log.Println("[INFO] Logged mistake")
+}
+
+func (screen quizScreen) inputUpdate(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
 	case tea.KeyMsg:
 		switch msg.String() {
 		case "enter":
-			log.Println("[INFO] Answer submitted")
-			m.total_answers++
-			if m.isAnswerCorrect() {
-				m.correct_answers++
+			if screen.isAnswerCorrect() {
+				screen.correctAnswers++
+				screen.streak++
+				screen.statistics.continueStreak(screen.question.prompt)
+				log.Printf(
+					"[INFO] Answer is correct, new score is %.2f\n",
+					screen.statistics.statistics[screen.question.prompt].probWeight(),
+				)
+			} else {
+				screen.logMistake()
+				screen.streak = 0
+				screen.wrongAnswers++
+				screen.statistics.endStreak(screen.question.prompt)
+				log.Printf(
+					"[INFO] Answer is wrong, new score is %.2f\n",
+					screen.statistics.statistics[screen.question.prompt].probWeight(),
+				)
 			}
-			m.inputField.Blur() // Removes focus
-			m.mode = validation
-			return m, nil
+			screen.inputField.Blur() // Removes focus
+			screen.mode = validation
+			return screen, nil
 		}
 	}
 	var cmd tea.Cmd
-	m.inputField, cmd = m.inputField.Update(msg)
-	return m, cmd
+	screen.inputField, cmd = screen.inputField.Update(msg)
+	return screen, cmd
 }
 
-func (m model) validateUpdate(msg tea.Msg) (tea.Model, tea.Cmd) {
+func (screen quizScreen) validateUpdate(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
 	case tea.KeyMsg:
 		switch msg.String() {
 		case "enter":
 			log.Println("[INFO] New question requested")
-			m.question = m.database.getRandomQuestion()
-			m.inputField.Reset()
-			m.inputField.Focus() // Removes focus
-			m.mode = input
-			return m, textinput.Blink
+			screen.question = screen.statistics.getRandomQuestion()
+			screen.inputField.Reset()
+			screen.inputField.Focus() // Removes focus
+			screen.mode = input
+			return screen, textinput.Blink
 		}
 	}
 	var cmd tea.Cmd
-	m.inputField, cmd = m.inputField.Update(msg)
-	return m, cmd
+	screen.inputField, cmd = screen.inputField.Update(msg)
+	return screen, cmd
 }
 
 func (m *model) toggleAltScreen() (*model, tea.Cmd) {
@@ -233,16 +535,16 @@ func (m *model) toggleAltScreen() (*model, tea.Cmd) {
 	}
 }
 
-func (m model) isAnswerCorrect() bool {
-	return strings.TrimSpace(m.question.correct_answer) == strings.TrimSpace(m.inputField.Value())
+func (screen quizScreen) isAnswerCorrect() bool {
+	return strings.TrimSpace(screen.question.correctAnswer) == strings.TrimSpace(screen.inputField.Value())
 }
 
-func (m model) renderValidationRow() string {
-	if m.isAnswerCorrect() {
+func (screen quizScreen) renderValidationRow() string {
+	if screen.isAnswerCorrect() {
 		return correctAnswerStyle.Italic(true).Render("Correct!")
 	} else {
 		return wrongAnswerStyle.Render(
-			italic("Wrong!") + " Correct answer is: " + bold(m.question.correct_answer),
+			italic("Wrong!") + " Correct answer is: " + bold(screen.question.correctAnswer),
 		)
 	}
 }
@@ -254,33 +556,54 @@ var (
 	darkSeaGreen1 = lipgloss.ANSIColor(193)
 	darkSeaGreen4 = lipgloss.ANSIColor(65)
 	darkSeaGreen2 = lipgloss.ANSIColor(157)
+	darkOrange    = lipgloss.ANSIColor(208)
+	darkOrange3   = lipgloss.ANSIColor(166)
+	salmon1       = lipgloss.ANSIColor(209)
+	lightSalmon3  = lipgloss.ANSIColor(173)
+	wheat4        = lipgloss.ANSIColor(101)
 	// Not using ANSI here since first 16 ones could be redefined
 	black = lipgloss.Color("#000000")
 )
 
-var (
-	background    = lipgloss.NewStyle().Background(black)
-	promptStyle   = background.Italic(true).Foreground(darkSeaGreen4)
-	questionStyle = background.Foreground(darkSeaGreen1).Width(45 - 14)
-	helpMsgStyle  = background.Foreground(lightPink4)
-	helpKeyStyle  = helpMsgStyle.Bold(true)
+const (
+	boxWidth          = 45
+	boxHeight         = 12
+	horizontalPadding = 3
+	verticalPadding   = 1
+	totalBoxWidth     = boxWidth + 2*horizontalPadding
+	totalBoxHeight    = boxHeight + 2*verticalPadding
+)
 
+var (
+	background            = lipgloss.NewStyle().Background(black)
+	promptStyle           = background.Italic(true).Foreground(darkSeaGreen4)
+	promptStatsEntryStyle = background.Italic(false).Foreground(darkSeaGreen4)
+	questionStatsStyle    = background.Italic(true).Foreground(wheat4)
+	questionStyle         = background.Foreground(darkSeaGreen2)
+	statsTitleStyle       = background.Foreground(darkSeaGreen4).Width(boxWidth)
+	helpMsgStyle          = background.Foreground(lightPink4)
+	helpKeyStyle          = helpMsgStyle.Bold(true)
+
+	questionStatsAlignStyle = background.
+				AlignHorizontal(lipgloss.Center).
+				Width(boxWidth)
 	correctAnswerStyle = background.
 				AlignHorizontal(lipgloss.Center).
-				Width(39).
+				Width(boxWidth).
 				Foreground(darkSeaGreen2)
 	wrongAnswerStyle = background.
 				AlignHorizontal(lipgloss.Center).
-				Width(39).
+				Width(boxWidth).
 				Foreground(lightPink1)
 	boxStyle = background.
 			Align(lipgloss.Left, lipgloss.Center).
 			PaddingTop(0).
 			PaddingBottom(0).
-			PaddingLeft(3).
-			PaddingRight(3).
-			Width(45).
-			Height(9).
+			PaddingLeft(horizontalPadding).
+			PaddingTop(verticalPadding).
+			PaddingBottom(verticalPadding).
+			Width(totalBoxWidth).
+			Height(totalBoxHeight).
 			BorderStyle(lipgloss.RoundedBorder()).
 			BorderForeground(lightPink4).
 			BorderBackground(black)
@@ -345,33 +668,53 @@ func renderHelpRow(entries []helpEntry) string {
 	return lipgloss.NewStyle().Inline(true).Render(help_row)
 }
 
-func (m *model) renderStatsRow() string {
-	current_question := m.total_answers
-	if m.mode == input {
+func renderStatsTrisymbol(baseStyle lipgloss.Style, stats questionStats) string {
+	// questionStats probably would be changed for something like visibleStats
+	correctCounterStyle := baseStyle.Foreground(darkSeaGreen4)
+	mistakesCounterStyle := baseStyle.Foreground(lightPink4)
+	streakCounterStyle := baseStyle.Foreground(wheat4)
+	return correctCounterStyle.Render(strconv.Itoa(int(stats.correct))+" ● ") +
+		mistakesCounterStyle.Render(strconv.Itoa(int(stats.mistakes))+" ● ") +
+		streakCounterStyle.Render(strconv.Itoa(int(stats.streak))+" ●")
+}
+
+func (screen quizScreen) renderGlobalStatsRow() string {
+	current_question := int(screen.correctAnswers + screen.wrongAnswers)
+	if screen.mode == input {
 		// The current one is unanswered
 		current_question++
 	}
 	statsStyle := background.Foreground(darkSeaGreen4)
-	return statsStyle.Render("Question " +
-		bold(strconv.Itoa(current_question)) +
-		". Correct answers: " +
-		bold(strconv.Itoa(m.correct_answers)) +
-		"/" +
-		bold(strconv.Itoa(m.total_answers)))
+	statsTrisymbol := renderStatsTrisymbol(
+		statsStyle.Bold(true),
+		questionStats{screen.streak, screen.correctAnswers, screen.wrongAnswers},
+	)
+	return statsStyle.Width(boxWidth-lipgloss.Width(statsTrisymbol)).AlignHorizontal(lipgloss.Left).
+		Render("Question "+bold(strconv.Itoa(current_question))+".       ") +
+		statsTrisymbol
 }
 
-func (m model) renderQuestion() string {
-	prompt_block := lipgloss.JoinVertical(
-		lipgloss.Right,
+func (screen quizScreen) renderQuestion() string {
+	prompts := []string{
 		promptStyle.Render("Form Clue: "),
 		promptStyle.Render("Verb: "),
 		promptStyle.Render("Verb Form: "),
+	}
+	prompt_block := lipgloss.JoinVertical(
+		lipgloss.Right,
+		prompts...,
 	)
+	maxlen := 0
+	for _, prompt := range prompts {
+		maxlen = max(maxlen, lipgloss.Width(prompt))
+	}
+	questionBlockWidth := boxWidth - maxlen
+	questionBoxStyle := questionStyle.Width(questionBlockWidth)
 	question_block := lipgloss.JoinVertical(
 		lipgloss.Left,
-		questionStyle.Render(m.question.noun),
-		questionStyle.Render(m.question.verb),
-		questionStyle.Render(m.inputField.View()),
+		questionBoxStyle.Render(screen.question.prompt.formClue),
+		questionBoxStyle.Render(screen.question.prompt.verb),
+		questionBoxStyle.Render(screen.inputField.View()),
 	)
 	return lipgloss.JoinHorizontal(
 		lipgloss.Top,
@@ -382,51 +725,152 @@ func (m model) renderQuestion() string {
 
 var inputHelp = [...]helpEntry{
 	{bindings: []string{"enter"}, action: "submit"},
-	{bindings: []string{"esc", "q"}, action: "exit"},
+	{bindings: []string{"ctrl+s"}, action: "stats"},
+	{bindings: []string{"esc"}, action: "exit"},
 }
 
-func (m model) inputView() string {
-	return boxStyle.Render(lipgloss.JoinVertical(
+func (screen quizScreen) renderQuestionStatsRow() string {
+	return questionStatsAlignStyle.Render(questionStatsStyle.Render("[question stats: ") +
+		renderStatsTrisymbol(background.Italic(true), screen.statistics.statistics[screen.question.prompt]) +
+		questionStatsStyle.Render("]"))
+}
+
+func (screen quizScreen) inputView() string {
+	body := lipgloss.JoinVertical(
 		lipgloss.Left,
-		m.renderStatsRow(),
+		screen.renderGlobalStatsRow(),
 		"",
-		m.renderQuestion(),
+		screen.renderQuestion(),
 		"",
 		"",
-		"",
-		renderHelpRow(inputHelp[:]),
-	))
+		screen.renderQuestionStatsRow(),
+	)
+	footer := renderHelpRow(inputHelp[:])
+	spacing := boxHeight - lipgloss.Height(body) - lipgloss.Height(footer)
+	content := body + strings.Repeat("\n", spacing+1) + footer
+	return boxStyle.Render(content)
 }
 
 var validationHelp = [...]helpEntry{
-	{bindings: []string{"enter"}, action: "continue"},
-	{bindings: []string{"esc", "q"}, action: "exit"},
+	{bindings: []string{"enter"}, action: "next"},
+	{bindings: []string{"ctrl+s"}, action: "stats"},
+	{bindings: []string{"esc"}, action: "exit"},
 }
 
-func (m model) validationView() string {
-	return boxStyle.Render(lipgloss.JoinVertical(
+func (screen quizScreen) validationView() string {
+	footer := renderHelpRow(validationHelp[:])
+	body := lipgloss.JoinVertical(
 		lipgloss.Left,
-		m.renderStatsRow(),
+		screen.renderGlobalStatsRow(),
 		"",
-		m.renderQuestion(),
+		screen.renderQuestion(),
 		"",
-		m.renderValidationRow(),
 		"",
-		renderHelpRow(validationHelp[:]),
-	))
+		screen.renderValidationRow(),
+	)
+	spacing := boxHeight - lipgloss.Height(body) - lipgloss.Height(footer)
+	content := body + strings.Repeat("\n", spacing+1) + footer
+	return boxStyle.Render(content)
+}
+
+func (screen statisticsScreen) renderStatEntry(prompt prompt, selected bool) string {
+	statsTrisymbol := renderStatsTrisymbol(
+		background.Bold(selected).Italic(selected),
+		screen.statistics.statistics[prompt],
+	)
+	if selected {
+		bracketStyle := background.Italic(true).Foreground(wheat4)
+		statsTrisymbol = bracketStyle.Render("[") + statsTrisymbol + bracketStyle.Render("]")
+	} else {
+		statsTrisymbol += background.Render(" ")
+	}
+	promptFormated := fmt.Sprintf("%s + %s", prompt.formClue, prompt.verb)
+	if selected {
+		promptFormated = "> " + promptFormated
+	}
+	return promptStatsEntryStyle.
+		Bold(selected).
+		Italic(selected).
+		Width(boxWidth-lipgloss.Width(statsTrisymbol)).
+		AlignHorizontal(lipgloss.Left).
+		Render(promptFormated) +
+		statsTrisymbol
+}
+
+var statisticsScreenHelp = [...]helpEntry{
+	{bindings: []string{"k", "↑"}, action: "up"},
+	{bindings: []string{"j", "↓"}, action: "down"},
+	{bindings: []string{"backspace"}, action: "back"},
+	{bindings: []string{"esc"}, action: "exit"},
+}
+
+func (screen *statisticsScreen) scrollDown() {
+	keepOnScreen := 2
+	shownRows := boxHeight - 2 - 2
+	if screen.selectedRow < shownRows-keepOnScreen-1 {
+		screen.selectedRow++
+		return
+	}
+	if screen.firstShownIndex+shownRows < len(screen.orderedPromptList) {
+		screen.firstShownIndex++
+	} else if screen.selectedRow < shownRows-1 {
+		screen.selectedRow++
+	}
+}
+
+func (screen *statisticsScreen) scrollUp() {
+	keepOnScreen := 2
+	if screen.selectedRow > keepOnScreen {
+		screen.selectedRow--
+		return
+	}
+	if screen.firstShownIndex > 0 {
+		screen.firstShownIndex--
+	} else if screen.selectedRow > 0 {
+		screen.selectedRow--
+	}
+}
+
+func (screen statisticsScreen) View() string {
+	footer := renderHelpRow(statisticsScreenHelp[:])
+	renderedLines := []string{statsTitleStyle.Render("Statistics"), ""}
+	shownRows := boxHeight - 2 - 2
+	for row := 0; row < shownRows; row++ {
+		promptIndex := screen.firstShownIndex + row
+		if promptIndex >= len(screen.orderedPromptList) {
+			break
+		}
+		entryPrompt := screen.orderedPromptList[promptIndex]
+		renderedLines = append(renderedLines, screen.renderStatEntry(
+			entryPrompt,
+			row == screen.selectedRow,
+		))
+	}
+	body := lipgloss.JoinVertical(
+		lipgloss.Left,
+		renderedLines...,
+	)
+	spacing := boxHeight - lipgloss.Height(body) - lipgloss.Height(footer)
+	content := body + strings.Repeat("\n", spacing+1) + footer
+	return boxStyle.Render(content)
+}
+
+func (screen quizScreen) View() string {
+	switch screen.mode {
+	case input:
+		return screen.inputView()
+	case validation:
+		return screen.validationView()
+	}
+	exitNonExistingMode()
+	return "" //unreachable
 }
 
 func (m model) View() string {
-	var content string
-	switch m.mode {
-	case input:
-		content = m.inputView()
-	case validation:
-		content = m.validationView()
-	default:
-		exitNonExistingMode()
-	}
+	content := m.screen.View()
 	if !m.isInAltscreen {
+		// Terminal wants everything to end
+		// with explicit newline character
 		return content + "\n"
 	}
 	return lipgloss.NewStyle().
@@ -438,7 +882,7 @@ func (m model) View() string {
 }
 
 func main() {
-	f, err := tea.LogToFile("log", "")
+	f, err := tea.LogToFile(logPath, "")
 	defer f.Close()
 	if err != nil {
 		log.Printf("[FATAL] %v\n", err)
