@@ -1,8 +1,10 @@
 package main
 
 import (
+	_ "embed"
 	"errors"
 	"fmt"
+	"io"
 	"io/fs"
 	"log"
 	"math/rand"
@@ -31,18 +33,12 @@ const (
 	internalError        exitCode = 4
 	mistakesLoggingError exitCode = 5
 	statisticsError      exitCode = 6
+	configError          exitCode = 7
 )
 
 func exit(code exitCode) {
 	os.Exit(int(code))
 }
-
-const (
-	wordDatabasePath = "words.xlsx"
-	logPath          = "log"
-	mistakesPath     = "mistakes"
-	statisticsPath   = "statistics.toml"
-)
 
 type wordDatabase struct {
 	formClue  []string
@@ -50,8 +46,8 @@ type wordDatabase struct {
 	verbForms [][]string
 }
 
-func read_database() wordDatabase {
-	table, err := excelize.OpenFile(wordDatabasePath)
+func readDatabase(path string) wordDatabase {
+	table, err := excelize.OpenFile(path)
 	if err != nil {
 		log.Printf("[FATAL] %v\n", err)
 		exit(databaseError)
@@ -203,12 +199,15 @@ func (statisticsDatabase statisticsDatabase) pack() statisticsDatabaseTOML {
 }
 
 func (screen quizScreen) saveStatistics() {
+	if !screen.config.WriteStatistics {
+		return
+	}
 	bytes, err := toml.Marshal(screen.statistics.pack())
 	if err != nil {
 		log.Printf("[FATAL] Unachievable TOML encoding error\n")
 		exit(internalError)
 	}
-	err = os.WriteFile(statisticsPath, bytes, 0666)
+	err = os.WriteFile(screen.config.StatisticsPath, bytes, 0666)
 	if err != nil {
 		log.Printf("[FATAL] Could not write to statistics.toml\n")
 		exit(statisticsError)
@@ -269,10 +268,13 @@ func (database wordDatabase) emptyStatistics() statisticsDatabase {
 	return statisticsDatabase{statistics, answers, totalProbWeight, map[string]promptDataTOML{}}
 }
 
-func (database wordDatabase) loadStatistics() statisticsDatabase {
+func (database *wordDatabase) loadStatistics(config *config) statisticsDatabase {
 	statistics := database.emptyStatistics()
+	if !config.WriteStatistics {
+		return statistics
+	}
 	log.Printf("[INFO] Trying to read statistics file...")
-	bytes, err := os.ReadFile(statisticsPath)
+	bytes, err := os.ReadFile(config.StatisticsPath)
 	if err != nil {
 		if errors.Is(err, fs.ErrNotExist) {
 			log.Println("[INFO] Statistics file not found")
@@ -320,7 +322,34 @@ const (
 	validation
 )
 
+type config struct {
+	StartInAltScreen            bool
+	AllowSwitchingToAltScreen   bool
+	AllowSwitchingFromAltScreen bool
+	WriteLogs                   bool
+	WriteMistakes               bool
+	WriteStatistics             bool
+	LogsPath                    string
+	MistakesPath                string
+	StatisticsPath              string
+	WordDatabasePath            string
+}
+
+//go:embed default_config.toml
+var defaultConfigBytes []byte
+
+func loadFileOrGetDefaultConfig() config {
+	var defaultConfig config
+	err := toml.Unmarshal(defaultConfigBytes, &defaultConfig)
+	if err != nil {
+		log.Printf("[FATAL] Embedded config is not valid:\n %v\n", err)
+		exit(configError)
+	}
+	return defaultConfig
+}
+
 type model struct {
+	config        *config
 	screen        tea.Model
 	isInAltscreen bool
 	height        int
@@ -328,6 +357,7 @@ type model struct {
 }
 
 type quizScreen struct {
+	config         *config
 	statistics     *statisticsDatabase
 	mode           mode
 	question       question
@@ -338,6 +368,7 @@ type quizScreen struct {
 }
 
 type statisticsScreen struct {
+	config            *config
 	previousScreen    *quizScreen
 	statistics        *statisticsDatabase
 	orderedPromptList []prompt
@@ -345,9 +376,9 @@ type statisticsScreen struct {
 	selectedRow       int
 }
 
-func initialModel() model {
-	database := read_database()
-	statistics := database.loadStatistics()
+func initialModel(config *config) model {
+	database := readDatabase(config.WordDatabasePath)
+	statistics := database.loadStatistics(config)
 	question := statistics.getRandomQuestion()
 	inputField := textinput.New()
 	inputField.Focus()
@@ -355,7 +386,9 @@ func initialModel() model {
 	inputField.Width = 15
 	inputField.CharLimit = 30
 	return model{
+		config: config,
 		screen: quizScreen{
+			config:         config,
 			statistics:     &statistics,
 			question:       question,
 			inputField:     inputField,
@@ -363,7 +396,7 @@ func initialModel() model {
 			wrongAnswers:   0,
 			correctAnswers: 0,
 		},
-		isInAltscreen: true,
+		isInAltscreen: config.StartInAltScreen,
 	}
 }
 
@@ -416,6 +449,7 @@ func (screen quizScreen) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		case "ctrl+s":
 			screen.saveStatistics()
 			return statisticsScreen{
+				config:            screen.config,
 				previousScreen:    &screen,
 				statistics:        screen.statistics,
 				orderedPromptList: screen.statistics.sortPromptsArbitraryOrder(),
@@ -458,7 +492,10 @@ func (screen statisticsScreen) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 }
 
 func (screen quizScreen) logMistake() {
-	f, err := os.OpenFile(mistakesPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0666)
+	if !screen.config.WriteMistakes {
+		return
+	}
+	f, err := os.OpenFile(screen.config.MistakesPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0666)
 	defer f.Close()
 	if err != nil {
 		log.Println("[ERROR] Failed to log mistake")
@@ -883,15 +920,25 @@ func (m model) View() string {
 }
 
 func main() {
-	f, err := tea.LogToFile(logPath, "")
-	defer f.Close()
-	if err != nil {
-		log.Printf("[FATAL] %v\n", err)
-		exit(loggingError)
+	config := loadFileOrGetDefaultConfig()
+
+	if config.WriteLogs {
+		f, err := tea.LogToFile(config.LogsPath, "")
+		defer f.Close()
+		if err != nil {
+			log.Printf("[FATAL] %v\n", err)
+			exit(loggingError)
+		}
+	} else {
+		log.SetOutput(io.Discard)
 	}
 
 	log.Println("[INFO] Starting app...")
-	p := tea.NewProgram(initialModel(), tea.WithAltScreen())
+	options := []tea.ProgramOption{}
+	if config.StartInAltScreen {
+		options = append(options, tea.WithAltScreen())
+	}
+	p := tea.NewProgram(initialModel(&config), options...)
 	log.Println("[INFO] Starting UI loop...")
 	if _, err := p.Run(); err != nil {
 		log.Printf("[FATAL] Program finished with error:\n%v", err)

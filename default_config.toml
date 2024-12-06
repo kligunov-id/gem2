@@ -1,0 +1,10 @@
+StartInAltScreen = true
+AllowSwitchingToAltScreen = false
+AllowSwitchingFromAltScreen = false
+WriteLogs = false
+LogsPath = "log"
+WriteMistakes = false
+MistakesPath = "mistakes"
+WriteStatistics = false
+StatisticsPath = "statistics.toml"
+WordDatabasePath = "words.xlsx"
