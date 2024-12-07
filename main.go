@@ -336,16 +336,30 @@ type config struct {
 }
 
 //go:embed default_config.toml
-var defaultConfigBytes []byte
+var embeddedConfigBytes []byte
+var configLookupPathsPrioritySorted = []string{"config.toml"}
 
-func loadFileOrGetDefaultConfig() config {
-	var defaultConfig config
-	err := toml.Unmarshal(defaultConfigBytes, &defaultConfig)
+func readLookupPathsOrEmbeddedConfig() []byte {
+	for _, configPath := range configLookupPathsPrioritySorted {
+		configBytes, err := os.ReadFile(configPath)
+		if errors.Is(err, fs.ErrExist) {
+			log.Printf("[FATAL] Config file %v is present, but cannot be opened:\n %v\n", configPath, err)
+			exit(configError)
+		}
+		if err == nil {
+			return configBytes
+		}
+	}
+	return embeddedConfigBytes
+}
+func loadFileOrEmbeddedConfig() config {
+	var config config
+	err := toml.Unmarshal(readLookupPathsOrEmbeddedConfig(), &config)
 	if err != nil {
-		log.Printf("[FATAL] Embedded config is not valid:\n %v\n", err)
+		log.Printf("[FATAL] Chosen config is not valid:\n %v\n", err)
 		exit(configError)
 	}
-	return defaultConfig
+	return config
 }
 
 type model struct {
@@ -920,7 +934,7 @@ func (m model) View() string {
 }
 
 func main() {
-	config := loadFileOrGetDefaultConfig()
+	config := loadFileOrEmbeddedConfig()
 
 	if config.WriteLogs {
 		f, err := tea.LogToFile(config.LogsPath, "")
